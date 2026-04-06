@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>SphericalKV Tier Allocation</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;700&display=swap');
+  :root {
+    --bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;
+    --text-dim:#8b949e;--accent:#58a6ff;
+    --high:#2DC653;--mid:#4361EE;--low:#F77F00;--drop:#6c757d;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{font-family:'DM Sans',system-ui,sans-serif;background:var(--bg);
+        color:var(--text);min-height:100vh;padding:2rem;}
+  .header{text-align:center;margin-bottom:2rem;}
+  .header h1{font-size:1.8rem;font-weight:700;
+    background:linear-gradient(135deg,var(--accent),var(--high));
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
+    margin-bottom:.3rem;}
+  .header .subtitle{color:var(--text-dim);font-size:.95rem;}
+  .meta-bar{display:flex;justify-content:center;gap:1.5rem;flex-wrap:wrap;
+    margin-bottom:1.5rem;font-family:'JetBrains Mono',monospace;font-size:.78rem;
+    color:var(--text-dim);}
+  .meta-bar span{background:var(--surface);border:1px solid var(--border);
+    border-radius:6px;padding:.35rem .75rem;}
+  .meta-bar .val{color:var(--accent);font-weight:600;}
+  .legend{display:flex;justify-content:center;gap:1.5rem;margin-bottom:1.5rem;
+    font-size:.85rem;}
+  .legend-item{display:flex;align-items:center;gap:.4rem;}
+  .legend-dot{width:12px;height:12px;border-radius:3px;}
+  .legend-bits{font-family:'JetBrains Mono',monospace;color:var(--text-dim);
+    font-size:.75rem;}
+  .slider-container{background:var(--surface);border:1px solid var(--border);
+    border-radius:12px;padding:1.5rem 2rem;max-width:700px;margin:0 auto 2rem;
+    text-align:center;}
+  .slider-label{font-size:.9rem;color:var(--text-dim);margin-bottom:.5rem;}
+  .slider-value{font-family:'JetBrains Mono',monospace;font-size:2rem;
+    font-weight:600;color:var(--accent);margin-bottom:.5rem;}
+  .slider-value .unit{font-size:1rem;color:var(--text-dim);}
+  .slider-value .budget-bits{font-size:.85rem;color:var(--text-dim);
+    font-weight:400;display:block;margin-top:.2rem;}
+  input[type="range"]{-webkit-appearance:none;width:100%;height:6px;
+    border-radius:3px;background:var(--border);outline:none;}
+  input[type="range"]::-webkit-slider-thumb{-webkit-appearance:none;width:22px;
+    height:22px;border-radius:50%;background:var(--accent);cursor:pointer;
+    box-shadow:0 0 8px rgba(88,166,255,.4);}
+  input[type="range"]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;
+    background:var(--accent);cursor:pointer;border:none;}
+  .slider-endpoints{display:flex;justify-content:space-between;
+    font-family:'JetBrains Mono',monospace;font-size:.75rem;color:var(--text-dim);
+    margin-top:.3rem;}
+  .charts-row{display:grid;grid-template-columns:1fr 1fr;gap:1.5rem;
+    max-width:1100px;margin:0 auto 2rem;}
+  .chart-card{background:var(--surface);border:1px solid var(--border);
+    border-radius:12px;padding:1rem;}
+  .chart-card h3{text-align:center;font-size:1rem;font-weight:600;
+    margin-bottom:.3rem;}
+  .chart-card .phase-tag{display:block;text-align:center;font-size:.75rem;
+    color:var(--text-dim);margin-bottom:.5rem;
+    font-family:'JetBrains Mono',monospace;}
+  .diff-table{max-width:700px;margin:0 auto 2rem;background:var(--surface);
+    border:1px solid var(--border);border-radius:12px;overflow:hidden;}
+  .diff-table table{width:100%;border-collapse:collapse;
+    font-family:'JetBrains Mono',monospace;font-size:.82rem;}
+  .diff-table th{background:rgba(88,166,255,.08);padding:.6rem 1rem;
+    text-align:left;font-weight:600;color:var(--text-dim);
+    border-bottom:1px solid var(--border);}
+  .diff-table td{padding:.5rem 1rem;border-bottom:1px solid var(--border);}
+  .diff-table tr:last-child td{border-bottom:none;}
+  .diff-pos{color:var(--high);} .diff-neg{color:#f85149;}
+  .diff-zero{color:var(--text-dim);}
+  .area-card{background:var(--surface);border:1px solid var(--border);
+    border-radius:12px;padding:1rem;max-width:1100px;margin:0 auto 2rem;}
+  .area-card h3{text-align:center;font-size:1rem;font-weight:600;
+    margin-bottom:.5rem;}
+  .stamp{text-align:center;color:var(--text-dim);font-size:.75rem;
+    font-family:'JetBrains Mono',monospace;margin-top:1rem;}
+  @media(max-width:768px){.charts-row{grid-template-columns:1fr;}
+    body{padding:1rem;}}
+</style>
+</head>
+<body>
+ 
+<div class="header">
+  <h1>SphericalKV Tier Allocation</h1>
+  <p class="subtitle">Prefill and Decode time distributions at multiple budget points</p>
+</div>
+ 
+<div class="meta-bar">
+  <span>Model: <span class="val">Llama-3.2-1B</span></span>
+  <span>Dataset: <span class="val">pg19</span></span>
+  <span>T = <span class="val">512</span></span>
+  <span>L = <span class="val">16</span></span>
+  <span>H_kv = <span class="val">8</span></span>
+  <span>dh = <span class="val">64</span></span>
+  <span>Decode = <span class="val">72 steps</span></span>
+  <span>Refresh = <span class="val">every 16</span></span>
+</div>
+ 
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:var(--high)"></div>
+    High (b1) <span class="legend-bits">56b</span></div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--mid)"></div>
+    Mid (b2) <span class="legend-bits">48b</span></div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--low)"></div>
+    Low (b3) <span class="legend-bits">22b</span></div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--drop)"></div>
+    Dropped <span class="legend-bits">0b</span></div>
+</div>
+ 
+<div class="slider-container">
+  <div class="slider-label">Bits Per Token (budget)</div>
+  <div class="slider-value" id="bpt-display">--</div>
+  <input type="range" id="bpt-slider" min="0" max="1" step="1" value="0"/>
+  <div class="slider-endpoints"><span id="bpt-min">--</span><span id="bpt-max">--</span></div>
+</div>
+ 
+<div class="charts-row">
+  <div class="chart-card">
+    <h3>Prefill Allocation</h3>
+    <span class="phase-tag"> Reuse & Stability proxy</span>
+    <div id="pie-prefill"></div>
+  </div>
+  <div class="chart-card">
+    <h3>Decode Allocation</h3>
+    <span class="phase-tag">Compressed decode with online_refresh</span>
+    <div id="pie-decode"></div>
+  </div>
+</div>
+ 
+<div id="diff-section" class="diff-table"></div>
+ 
+<div class="area-card">
+  <h3>Tier Distribution vs Budget -- Prefill</h3>
+  <div id="area-prefill"></div>
+</div>
+<div class="area-card">
+  <h3>Tier Distribution vs Budget -- Decode</h3>
+  <div id="area-decode"></div>
+</div>
+ 
+ 
+<script>
+const P = {"bpt": [6.6, 9.6, 12.7, 15.7, 18.8, 21.8, 24.9, 27.9, 30.9, 34.0, 37.0, 40.1, 43.1, 46.1, 49.2, 52.2, 55.3, 58.3, 61.4, 64.4], "high": [0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.007812, 0.351807, 0.732071, 0.9375, 0.9375, 0.9375, 0.9375], "mid": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.099487, 0.216492, 0.333496, 0.4505, 0.567505, 0.684509, 0.801514, 0.918518, 0.585693, 0.205429, 0.0, 0.0, 0.0, 0.0], "low": [0.280106, 0.418381, 0.556656, 0.694931, 0.833221, 0.971497, 0.8927, 0.775696, 0.658691, 0.541687, 0.424683, 0.307678, 0.190674, 0.073669, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625, 0.0625], "drop": [0.712082, 0.573807, 0.435532, 0.297256, 0.158966, 0.020691, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]};
+const D = {"bpt": [6.6, 9.6, 12.7, 15.7, 18.8, 21.8, 24.9, 27.9, 30.9, 34.0, 37.0, 40.1, 43.1, 46.1, 49.2, 52.2, 55.3, 58.3, 61.4, 64.4], "high": [0.01823, 0.013783, 0.01108, 0.009263, 0.007958, 0.006976, 0.006876, 0.006876, 0.006876, 0.006876, 0.006876, 0.006876, 0.006876, 0.006876, 0.308433, 0.641816, 0.821918, 0.821918, 0.821918, 0.821918], "mid": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.087195, 0.189774, 0.292353, 0.394933, 0.497512, 0.600091, 0.70267, 0.805249, 0.513485, 0.180102, 0.0, 0.0, 0.0, 0.0], "low": [0.98177, 0.986217, 0.98892, 0.990737, 0.992042, 0.993024, 0.905929, 0.80335, 0.700771, 0.598191, 0.495612, 0.393033, 0.290454, 0.187875, 0.178082, 0.178082, 0.178082, 0.178082, 0.178082, 0.178082], "drop": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]};
+const bpt = P.bpt, N = bpt.length;
+const T = 512, L = 16, H = 8;
+const C = {high:'#2DC653',mid:'#4361EE',low:'#F77F00',drop:'#6c757d'};
+const layout = {paper_bgcolor:'transparent',plot_bgcolor:'transparent',
+  font:{family:'DM Sans,system-ui',color:'#e6edf3',size:12},
+  margin:{t:10,b:10,l:10,r:10},showlegend:false};
+ 
+const sl = document.getElementById('bpt-slider');
+sl.min=0; sl.max=N-1; sl.value=Math.floor(N/2);
+document.getElementById('bpt-min').textContent=bpt[0];
+document.getElementById('bpt-max').textContent=bpt[N-1];
+ 
+function bar(div,data,i){
+  const v=[data.high[i]*100,data.mid[i]*100,data.low[i]*100,data.drop[i]*100];
+  const labels=['High (b1)','Mid (b2)','Low (b3)','Dropped'];
+  const colors=[C.high,C.mid,C.low,C.drop];
+  Plotly.react(div,[{x:labels,y:v,type:'bar',
+    marker:{color:colors,line:{color:'rgba(255,255,255,0.15)',width:1}},
+    text:v.map(x=>x.toFixed(1)+'%'),textposition:'outside',
+    textfont:{family:'JetBrains Mono',size:12,color:'#e6edf3'},
+    hovertemplate:'%{x}: %{y:.1f}%<extra></extra>'}],
+    {...layout,height:300,margin:{t:15,b:40,l:45,r:15},
+    xaxis:{color:'#8b949e',tickfont:{size:10}},
+    yaxis:{title:'%',color:'#8b949e',gridcolor:'#21262d',zeroline:false,
+      range:[0,Math.min(Math.max(...v)*1.25,105)]}},
+    {responsive:true,displayModeBar:false});
+}
+ 
+function diff(i){
+  const ts=['high','mid','low','drop'],ns=['High (b1)','Mid (b2)','Low (b3)','Dropped'],
+    cs=[C.high,C.mid,C.low,C.drop];
+  let rows='';
+  for(let j=0;j<4;j++){
+    const pf=P[ts[j]][i]*100,dc=D[ts[j]][i]*100,d=dc-pf;
+    const cls=d>.05?'diff-pos':d<-.05?'diff-neg':'diff-zero';
+    rows+=`<tr><td><span style="color:${cs[j]}">&#x25CF;</span> ${ns[j]}</td>
+      <td>${pf.toFixed(1)}%</td><td>${dc.toFixed(1)}%</td>
+      <td class="${cls}">${d>0?'+':''}${d.toFixed(1)}pp</td></tr>`;
+  }
+  document.getElementById('diff-section').innerHTML=`<table><thead><tr>
+    <th>Tier</th><th>Prefill</th><th>Decode</th><th>Delta</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+ 
+function area(div,data){
+  const tr=k=>{return{x:bpt,y:data[k].map(v=>v*100),name:k,fill:'tonexty',
+    fillcolor:C[k]+'55',line:{color:C[k],width:1.5},stackgroup:'s'}};
+  Plotly.react(div,[tr('high'),tr('mid'),tr('low'),tr('drop')],{...layout,height:280,
+    margin:{t:20,b:50,l:60,r:30},
+    xaxis:{title:'Bits per Token',color:'#8b949e',gridcolor:'#21262d',zeroline:false},
+    yaxis:{title:'%',color:'#8b949e',gridcolor:'#21262d',zeroline:false,range:[0,100]},
+    showlegend:true,legend:{orientation:'h',y:1.15,x:.5,xanchor:'center',
+      font:{size:11,color:'#8b949e'}},
+    shapes:[{type:'line',x0:bpt[0],x1:bpt[0],y0:0,y1:100,
+      line:{color:'#58a6ff',width:2,dash:'dot'}}]
+  },{responsive:true,displayModeBar:false});
+}
+ 
+function update(){
+  const i=parseInt(sl.value),b=bpt[i];
+  const bits=Math.round(b*T*L*H);
+  document.getElementById('bpt-display').innerHTML=
+    b+' <span class="unit">bpt</span>'+
+    '<span class="budget-bits">= '+bits.toLocaleString()+' bits global budget</span>';
+  bar('pie-prefill',P,i); bar('pie-decode',D,i); diff(i);
+  Plotly.relayout('area-prefill',{'shapes[0].x0':b,'shapes[0].x1':b});
+  Plotly.relayout('area-decode',{'shapes[0].x0':b,'shapes[0].x1':b});
+}
+ 
+area('area-prefill',P); area('area-decode',D);
+sl.addEventListener('input',update); update();
+</script>
+</body></html>

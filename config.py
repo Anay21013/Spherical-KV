@@ -1,0 +1,37 @@
+import torch
+
+HEADER_BYTES = 8
+PAGE_SIZE    = 128
+EPS          = 1e-8
+GROUP_SIZE   = 16
+HEAD_DIM     = 128
+NUM_GROUPS   = HEAD_DIM // GROUP_SIZE
+
+BR = 8   # bits per group radius (fixed for all tiers)
+
+GLOBAL_BUDGET_BITS = 5_000_000
+
+SINK_TOKENS   = 4
+RECENT_WINDOW = 32
+ 
+LAMBDA_THETA = {1: 0.05, 2: 0.10, 3: 0.30}
+LAMBDA_R     = {1: 0.01, 2: 0.01, 3: 0.01}
+ETA          = 10.0   # drop penalty (large so drops are last resort)
+ 
+EMA_BETA = 0.9   # smoothing factor β
+EMA_R    = 8     # max-over-window width R (recent attention steps)
+ 
+REFRESH_CADENCE = 16
+ 
+UPGRADE_KU = 4096
+ 
+# Asymmetric efficiency thresholds for hysteresis
+RHO_DOWN = float("inf")
+RHO_UP   = 0.002
+ 
+# after a tier change we are not touching these tokens for the next "COOLDOWN_STEPS" steps
+COOLDOWN_STEPS = 2
+
+ALPHA_THETA = 1.0
+ALPHA_R     = 1.0
+BITS_PER_TOKEN = 30.9
