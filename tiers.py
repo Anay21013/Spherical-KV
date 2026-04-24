@@ -1,8 +1,8 @@
-from config import BR, HEAD_DIM
+from config import BR, HEAD_DIM, B_META
 
 class Tier:
     def __init__(self, tier_id: int, g: int, b_theta: int, dh: int,
-                 br: int = BR, m: int = 1):
+                 br: int = BR, m: int = 1, b_meta: int = B_META):
         self.tier_id  = tier_id
         self.g        = g                        # group size
         self.b_theta  = b_theta                  # bits per codebook index
@@ -10,13 +10,14 @@ class Tier:
         self.br       = br                       # bits per group radius (always 8)
         self.m        = m                        # indices per group (always 1)
         self.G        = (dh // g) if g > 0 else 0  # number of groups
+        self.b_meta   = b_meta                   # meta-bits per token (flags/offsets)
 
         self.b_radius = br
  
     def token_bits(self) -> int:
         if self.tier_id == 0:
             return 0
-        return self.G * (self.br + self.m * self.b_theta)
+        return self.G * (self.br + self.m * self.b_theta) + self.b_meta
  
     @property
     def codebook_size(self) -> int:

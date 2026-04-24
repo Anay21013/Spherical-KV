@@ -3,6 +3,9 @@
 void decode_kernel_launcher(
     torch::Tensor pages,
     torch::Tensor pointer_table,
+    torch::Tensor positions,
+    torch::Tensor cos_table,
+    torch::Tensor sin_table,
     torch::Tensor q,
     torch::Tensor codebooks,
     torch::Tensor logits,
@@ -16,6 +19,9 @@ void decode_kernel_launcher(
 void fused_decode_forward(
     torch::Tensor pages,
     torch::Tensor pointer_table,
+    torch::Tensor positions,
+    torch::Tensor cos_table,
+    torch::Tensor sin_table,
     torch::Tensor q,
     torch::Tensor codebooks,
     torch::Tensor logits,
@@ -26,11 +32,13 @@ void fused_decode_forward(
     int page_size
 ){
     decode_kernel_launcher(
-        pages, pointer_table, q, codebooks, logits,
+        pages, pointer_table, positions, cos_table, sin_table,
+        q, codebooks, logits,
         dh, groups, group_size, b_theta, page_size
     );
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("forward", &fused_decode_forward, "Fused decode kernel (batched q)");
+    m.def("forward", &fused_decode_forward,
+          "Fused decode kernel with per-position Q back-rotation (ADA)");
 }

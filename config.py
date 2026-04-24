@@ -34,4 +34,28 @@ COOLDOWN_STEPS = 2
 
 ALPHA_THETA = 1.0
 ALPHA_R     = 1.0
-BITS_PER_TOKEN = 30.9
+BITS_PER_TOKEN = 34.9
+
+# ── Per-token meta-bits (Algorithm 1: R(t) includes b_meta) ───────────
+# Covers flags, offsets, tier-id per token in the page.
+B_META = 2   # bits per token (conservative default)
+
+# ── Anti-thrashing stickiness regularizer (C.4 optional) ──────────────
+# D_stick_i(b) = D_i(b) + GAMMA * 1[b != b_i(t-)]
+# Set to 0.0 to disable.
+GAMMA = 0.001
+
+# ── Lagrangian prices for per-layer/per-head caps (C.3) ───────────────
+# T_PI: number of price-update iterations per controller update
+LAGRANGE_T_PI      = 1
+LAGRANGE_STEP_SIZE = 0.01
+LAGRANGE_CLIP      = 1.0
+# Per-layer budget cap as fraction of global budget / num_layers.
+# Set to None to disable per-layer caps entirely.
+PER_LAYER_CAP_FRACTION  = None   # e.g. 1.2 = 120% of fair share
+PER_HEAD_CAP_FRACTION   = None   # e.g. 1.5 = 150% of fair share
+
+# ── Page alignment overhead (App A.2) ─────────────────────────────────
+# Extra bits per token to account for page headers, pointer table entries,
+# and alignment padding.  Added to tier cost in budget accounting.
+PAGE_ALIGNMENT_BITS_PER_TOKEN = 2

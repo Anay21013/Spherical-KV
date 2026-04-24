@@ -196,7 +196,9 @@ def measure_sphkv_decode(
     _bt_to_label = {6: "High (6-bit)", 4: "Mid (4-bit)", 3: "Low (3-bit)"}
 
     for (layer, head), tier_list in pipeline.per_head_pages.items():
-        for (pt, ptt, b_theta, n_tokens, V_tier, K_tier) in tier_list:
+        for entry in tier_list:
+            pt, ptt, b_theta = entry[0], entry[1], entry[2]
+            n_tokens, V_tier, K_tier = entry[3], entry[4], entry[5]
             kv_bytes += pt.numel()                              # compressed K
             kv_bytes += ptt.numel() * 4                        # pointer table
             if V_tier is not None:
@@ -307,7 +309,9 @@ def eval_memory_from_pipeline(pipeline, T: int) -> dict:
     total_retained    = 0
 
     for (layer, head), tier_list in pipeline.per_head_pages.items():
-        for (pt, ptt, b_theta, n_tokens, V_tier, K_tier) in tier_list:
+        for entry in tier_list:
+            pt, ptt, b_theta = entry[0], entry[1], entry[2]
+            n_tokens, V_tier, K_tier = entry[3], entry[4], entry[5]
             comp_K_pages += pt.numel()
             comp_ptable  += ptt.numel() * 4
             if V_tier is not None:
@@ -339,9 +343,6 @@ def eval_memory_from_pipeline(pipeline, T: int) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  SYNTHETIC DATA  (--dry_run)
-# ══════════════════════════════════════════════════════════════════════════
 
 def synthetic_run(T: int, model_cfg: dict) -> dict:
     """Realistic synthetic metrics for dry-run / CI testing."""
@@ -411,9 +412,6 @@ def synthetic_run(T: int, model_cfg: dict) -> dict:
     }
 
 
-# ══════════════════════════════════════════════════════════════════════════
-#  REAL RUN
-# ══════════════════════════════════════════════════════════════════════════
 
 def real_run(
     model,
@@ -425,17 +423,6 @@ def real_run(
     n_trials: int,
     device,
 ) -> dict:
-    """
-    Run one context-length point.
-
-    eval_ids is loaded ONCE in main() at max(context_lengths) + decode_buffer.
-    We slice [:context_len] so every T uses the same text prefix —
-    same document, growing context window, matching the paper benchmark.
-
-    This correctly decouples the two parameters:
-        num_eval_tokens = max_context + decode_buffer  (loaded once from dataset)
-        prefill_len     = context_len                  (sliced per sweep point)
-    """
     import torch
 
     prefill_ids = eval_ids[:context_len].unsqueeze(0).to(device)

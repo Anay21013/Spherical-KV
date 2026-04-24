@@ -112,7 +112,9 @@ def eval_memory_footprint(
     pointer_table_bytes       = 0
 
     for (layer, head), tier_list in pipeline.per_head_pages.items():
-        for (pages_tensor, ptable_tensor, _, n_tokens, _V, _K) in tier_list:
+        for entry in tier_list:
+            pages_tensor  = entry[0]
+            ptable_tensor = entry[1]
             compressed_K_pages_bytes += pages_tensor.numel()   # header+theta+radius
             pointer_table_bytes      += ptable_tensor.numel() * 4  # [P,3] int32
 
@@ -120,9 +122,10 @@ def eval_memory_footprint(
 
     # V stays dense FP16; sum V_tier sizes across all tiers/heads.
     retained_V_bytes = sum(
-        V_tier.numel() * 2
+        entry[4].numel() * 2
         for tier_list in pipeline.per_head_pages.values()
-        for (_, _, _, _, V_tier, _) in tier_list
+        for entry in tier_list
+        if entry[4] is not None
     )
 
     kv_bytes_per_token_compressed = (
@@ -299,8 +302,13 @@ def eval_attention_quality(
                     # b_theta→tier_id map from pipeline's tier list
                     _bt_to_tid = {t.b_theta: t.tier_id
                                   for t in pipeline.tiers if t.tier_id != 0}
-                    for (pt, ptt, b_theta, n_tokens, V_tier, K_tier) in ph:
-                        # Resolve tier-specific codebook and geometry
+                    for entry in ph:
+                        pt       = entry[0]
+                        ptt      = entry[1]
+                        b_theta  = entry[2]
+                        n_tokens = entry[3]
+                        V_tier   = entry[4]
+                        K_tier   = entry[5]
                         tier_id   = _bt_to_tid.get(b_theta, 1)
                         cb_lh     = pipeline.codebooks.get((li, h, tier_id))
                         tier_obj  = pipeline.tiers[tier_id]
@@ -314,8 +322,6 @@ def eval_attention_quality(
                             )
                             ctx_logit_parts.append(raw.view(-1)[:n_tokens])
                         else:
-                            # ADA-compliant reference path:
-                            # K_tier is (r_codes, th_codes) -- never dense K.
                             _r_c, _th_c = K_tier
                             _r_c  = _r_c.to(device)            # [N, tier_G]
                             _th_c = _th_c.to(device)           # [N, tier_G]
@@ -357,11 +363,6 @@ def eval_attention_quality(
                     (attn_out_approx - exact_out).pow(2).mean().sqrt().item()
                 )
 
-                # Logit drift: compare compressed vs exact over the retained set.
-                # Slot [5] is now (r_codes, th_codes), not dense K.
-                # We use K_ref (the dense baseline tensor loaded for this eval
-                # function) indexed by the retained token positions, which is
-                # the correct baselining reference.
                 n_ctx = len(ctx_logits_approx)
                 if n_ctx > 0:
                     # Retained token indices in positional order.
@@ -389,10 +390,6 @@ def eval_attention_quality(
         "num_measurements":      len(l2_errs),
     }
 
-
-# ---------------------------------------------------------------------------
-# 4. Perplexity  (W1: PG-19 strided NLL, paper Sec 3.3)
-# ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def eval_perplexity(
@@ -442,9 +439,6 @@ def eval_perplexity(
     }
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -541,6 +535,18 @@ def main():
             "    ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum \\\n"
             "        --nvtx --nvtx-include angle_logits python evaluate.py ..."
         )
+
+    if not args.skip_perplexity:
+        print(f"\n{sep}\n  Perplexity\n{sep}")
+        ppl_result = eval_perplexity(
+            model, tokenizer, pipeline,
+            eval_ids, prefill_len=args.prefill_len,
+        )
+        for k, v in ppl_result.items():
+            if isinstance(v, float):
+                print(f"  {k:<40s}  {v:.4f}")
+            else:
+                print(f"  {k:<40s}  {v}")
 
     pipeline.uninstall()
     print(f"\n{sep}\n  Done.\n{sep}")
