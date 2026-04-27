@@ -189,13 +189,17 @@ def measure_sphkv_decode(
         # Fresh prefill each trial
         pipeline.prefill(prefill_ids)
 
-        current_ids = prefill_ids.clone()
+        # First decode token must be eval_ids[T] at position T — exactly
+        # mirroring the dense baseline.  Re-feeding prefill_ids[:, -1:]
+        # would (a) duplicate the last prefill token and (b) shift every
+        # subsequent token one position forward in the spherical cache,
+        # creating a corrupted context the model has never seen.
+        last_tok = eval_ids[:, T:T + 1].to(device)
 
         for wi in range(n_warm):
-            out = model(input_ids=current_ids[:, -1:],
+            out = model(input_ids=last_tok,
                         use_cache=False, return_dict=True)
-            ref_tok = eval_ids[:, T + wi : T + wi + 1].to(device)
-            current_ids = torch.cat([current_ids, ref_tok], dim=-1)
+            last_tok = eval_ids[:, T + 1 + wi : T + 2 + wi].to(device)
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -206,19 +210,18 @@ def measure_sphkv_decode(
         nll_sum = 0.0
         gen_ids = []
         for step in range(n_meas):
-            out = model(input_ids=current_ids[:, -1:],
+            out = model(input_ids=last_tok,
                         use_cache=False, return_dict=True)
             logits = out.logits[:, -1, :]
 
-            ref_idx = T + n_warm + step
+            ref_idx = T + n_warm + 1 + step
             ref_tok_id = eval_ids[0, ref_idx].item()
 
             log_probs = F.log_softmax(logits, dim=-1)
             nll_sum -= log_probs[0, ref_tok_id].item()
 
             gen_ids.append(ref_tok_id)
-            ref_tok = eval_ids[:, ref_idx:ref_idx + 1].to(device)
-            current_ids = torch.cat([current_ids, ref_tok], dim=-1)
+            last_tok = eval_ids[:, ref_idx:ref_idx + 1].to(device)
 
         if device.type == "cuda":
             te.record()
