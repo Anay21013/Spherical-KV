@@ -123,20 +123,33 @@ def load_agentbench_dataset(
 
 
 def _make_synthetic_episodes(n: int) -> List[dict]:
-    """Generate synthetic multi-step tool-use episodes for testing."""
+    """Generate synthetic multi-step tool-use episodes for testing.
+
+    Each task has a verifiable gold_answer.  This is essential — without
+    it, success reduces to "did the model emit any finish tool call?",
+    which is a meaningless metric (an instruction-tuned model that
+    immediately writes `{"tool": "finish", "args": {"answer": ""}}`
+    would score 100%).
+    """
     episodes = []
     tasks = [
-        "What is the population of France multiplied by 2?",
-        "Find the capital of Japan and look up its founding year.",
-        "Search for the tallest mountain and calculate its height in feet.",
-        "Look up Python programming language and find its release year.",
-        "What is 42 * 17 + 83?",
+        {"instruction": "Use the calculator to compute 12 * 7.",
+         "gold_answer": "84"},
+        {"instruction": "Use the calculator to compute 42 * 17 + 83.",
+         "gold_answer": "797"},
+        {"instruction": "Use the calculator to compute (15 + 9) * 4.",
+         "gold_answer": "96"},
+        {"instruction": "Search for the capital of Japan.",
+         "gold_answer": "Tokyo"},
+        {"instruction": "Search for the author of the play Hamlet.",
+         "gold_answer": "Shakespeare"},
     ]
     for i in range(n):
+        t = tasks[i % len(tasks)]
         episodes.append({
-            "instruction": tasks[i % len(tasks)],
-            "tools":       DEFAULT_TOOL_SCHEMA,
-            "gold_answer": "",
+            "instruction":     t["instruction"],
+            "tools":           DEFAULT_TOOL_SCHEMA,
+            "gold_answer":     t["gold_answer"],
             "gold_trajectory": [],
         })
     print(f"[W3] Generated {n} synthetic episodes")
@@ -144,14 +157,32 @@ def _make_synthetic_episodes(n: int) -> List[dict]:
 
 # Agent episode runner
 
-AGENT_SYSTEM_PROMPT = """You are a helpful assistant with access to tools. 
-When you need to use a tool, respond with a JSON object: {{"tool": "name", "args": {{"param": "value"}}}}
-When you have the final answer, use: {{"tool": "finish", "args": {{"answer": "your answer"}}}}
+AGENT_SYSTEM_PROMPT = """You are a helpful assistant with access to tools. \
+You MUST respond with exactly one JSON object per turn — nothing else, \
+no prose before or after.
+
+Use a tool by emitting:
+{{"tool": "tool_name", "args": {{"param": "value"}}}}
+
+When you have the final answer, emit:
+{{"tool": "finish", "args": {{"answer": "your answer"}}}}
 
 Available tools:
 {tools_desc}
 
-Respond with exactly one tool call per turn."""
+Examples
+--------
+Task: What is 12 times 7?
+{{"tool": "calculator", "args": {{"expression": "12*7"}}}}
+Tool response: 84
+{{"tool": "finish", "args": {{"answer": "84"}}}}
+
+Task: Who wrote Hamlet?
+{{"tool": "search", "args": {{"query": "author of Hamlet"}}}}
+Tool response: William Shakespeare wrote Hamlet around 1600.
+{{"tool": "finish", "args": {{"answer": "William Shakespeare"}}}}
+
+Now begin. Respond with exactly one JSON tool call per turn."""
 
 
 def _format_tools_desc(tools: List[dict]) -> str:
@@ -164,30 +195,30 @@ def _format_tools_desc(tools: List[dict]) -> str:
 
 def _parse_tool_call(text: str) -> Optional[Tuple[str, dict]]:
     """Extract tool call from model output."""
-    # Try JSON parsing
-    try:
-        # Find JSON-like pattern
-        match = re.search(r'\{[^{}]*"tool"[^{}]*\}', text)
-        if match:
-            obj = json.loads(match.group())
-            return obj.get("tool", ""), obj.get("args", {})
-    except (json.JSONDecodeError, AttributeError):
-        pass
-
-    # Fallback: simple pattern matching
-    for pattern in [
-        r'tool["\s:]+(\w+).*?args["\s:]+\{(.+?)\}',
-        r'"tool"\s*:\s*"(\w+)"',
-    ]:
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            tool_name = match.group(1)
+    decoder = json.JSONDecoder()
+    n = len(text)
+    i = 0
+    while i < n:
+        if text[i] == '{':
             try:
-                args_str = match.group(2)
-                args = json.loads("{" + args_str + "}")
-            except (IndexError, json.JSONDecodeError):
-                args = {}
-            return tool_name, args
+                obj, end = decoder.raw_decode(text, i)
+            except json.JSONDecodeError:
+                i += 1
+                continue
+            if isinstance(obj, dict) and "tool" in obj:
+                tool = obj.get("tool", "")
+                args = obj.get("args", {})
+                if not isinstance(args, dict):
+                    args = {}
+                return str(tool), args
+            i = end
+        else:
+            i += 1
+
+    # Last-ditch fallback: a bare "tool: name" mention with no JSON.
+    m = re.search(r'"?tool"?\s*[:=]\s*"?([A-Za-z_]\w*)"?', text)
+    if m:
+        return m.group(1), {}
 
     return None
 
@@ -265,7 +296,16 @@ def run_episode(
 
         if tool_name == "finish":
             final_answer = tool_args.get("answer", "")
-            success = True
+            gold = str(episode.get("gold_answer", "")).strip().lower()
+            answer_norm = str(final_answer).strip().lower()
+            if gold:
+                # Substring match in either direction is forgiving enough
+                # for "Tokyo" vs "Tokyo, Japan" and "84" vs "the answer is 84".
+                success = (gold in answer_norm) or (answer_norm in gold and answer_norm != "")
+            else:
+                # No gold answer available (e.g. trajectory-only AgentBench
+                # episodes) — fall back to "model emitted finish".
+                success = True
             break
 
         # Execute tool and append response
