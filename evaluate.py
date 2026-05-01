@@ -47,9 +47,9 @@ def load_model_and_tokenizer(name_or_path: str, device: torch.device):
     tokenizer = AutoTokenizer.from_pretrained(name_or_path)
     model = LlamaForCausalLM.from_pretrained(
         name_or_path,
-        dtype=torch.float32,
+        torch_dtype=torch.float16,
         device_map={"": device},
-        attn_implementation="eager",
+        attn_implementation="sdpa",
     )
     model.eval()
     return model, tokenizer
@@ -75,7 +75,7 @@ def get_eval_tokens(
 def _load_dataset_tokens(tokenizer, dataset_name: str, num_tokens: int) -> torch.Tensor:
     from datasets import load_dataset
     if dataset_name == "pg19":
-        ds   = load_dataset("pg19", split="test", trust_remote_code=True, streaming=True)
+        ds   = load_dataset("emozilla/pg19", split="test", streaming=True)
         # text = " ".join(ds["text"][:5])
         texts = []
         for i, example in enumerate(ds):

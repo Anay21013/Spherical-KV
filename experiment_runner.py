@@ -197,8 +197,18 @@ def measure_sphkv_decode(
         last_tok = eval_ids[:, T:T + 1].to(device)
 
         for wi in range(n_warm):
-            out = model(input_ids=last_tok,
-                        use_cache=False, return_dict=True)
+            with torch.no_grad():
+                hidden_states = model.model.embed_tokens(last_tok)
+                for layer in model.model.layers:
+                    residual = hidden_states
+                    hidden_states = layer.input_layernorm(hidden_states)
+                    attn_out, _ = layer.self_attn(hidden_states)
+                    hidden_states = residual + attn_out
+                    residual = hidden_states
+                    hidden_states = layer.post_attention_layernorm(hidden_states)
+                    hidden_states = residual + layer.mlp(hidden_states)
+                hidden_states = model.model.norm(hidden_states)
+                _ = model.lm_head(hidden_states)
             last_tok = eval_ids[:, T + 1 + wi : T + 2 + wi].to(device)
 
         if device.type == "cuda":
@@ -210,9 +220,29 @@ def measure_sphkv_decode(
         nll_sum = 0.0
         gen_ids = []
         for step in range(n_meas):
-            out = model(input_ids=last_tok,
-                        use_cache=False, return_dict=True)
-            logits = out.logits[:, -1, :]
+            if step < 3:
+                torch.cuda.synchronize()
+                import time as _t; _st = _t.perf_counter()
+
+            # Manual forward — bypass HF model.forward overhead entirely
+            with torch.no_grad():
+                hidden_states = model.model.embed_tokens(last_tok)
+                for layer in model.model.layers:
+                    residual = hidden_states
+                    hidden_states = layer.input_layernorm(hidden_states)
+                    attn_out, _ = layer.self_attn(hidden_states)
+                    hidden_states = residual + attn_out
+                    residual = hidden_states
+                    hidden_states = layer.post_attention_layernorm(hidden_states)
+                    hidden_states = residual + layer.mlp(hidden_states)
+                hidden_states = model.model.norm(hidden_states)
+                logits_all = model.lm_head(hidden_states)
+
+            if step < 3:
+                torch.cuda.synchronize()
+                _et = _t.perf_counter()
+                print(f"[STEP TIMING] step={step} manual_forward={(_et-_st)*1000:.1f}ms", flush=True)
+            logits = logits_all[:, -1, :]
 
             ref_idx = T + n_warm + 1 + step
             ref_tok_id = eval_ids[0, ref_idx].item()
@@ -638,6 +668,8 @@ def parse_args():
 
     # Output
     p.add_argument("--output_dir", default="experiment_results")
+    p.add_argument("--backend", default="hf", choices=["hf", "vllm"],
+                   help="Backend: 'hf' (HuggingFace) or 'vllm' (vLLM optimized serving)")
 
     # W2 options
     p.add_argument("--w2_task", default="hotpotqa",
@@ -680,15 +712,40 @@ def main():
         print(f"\n{'#'*70}")
         print(f"  Model: {model_path}")
         print(f"  Codebooks: {cb_dir}")
+        print(f"  Backend: {args.backend}")
         print(f"{'#'*70}")
 
-        model, tokenizer = load_model_and_tokenizer(model_path, device)
-        cfg = model.config
-        num_layers   = cfg.num_hidden_layers
-        num_kv_heads = getattr(cfg, "num_key_value_heads",
-                               cfg.num_attention_heads)
-        head_dim     = getattr(cfg, "head_dim",
-                               cfg.hidden_size // cfg.num_attention_heads)
+        if args.backend == "vllm":
+            from vllm_backend import load_vllm_model, VLLMDirectForward
+            from vllm_backend import measure_dense_vllm, measure_sphkv_vllm
+            from transformers import AutoTokenizer
+            vllm_engine, raw_model, model_runner = load_vllm_model(model_path)
+            vllm_fwd = VLLMDirectForward(raw_model, device)
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = None  # NO HF model loaded
+            print(f"[vLLM] Loaded model with {vllm_fwd.num_layers} layers, "
+                  f"{vllm_fwd.num_q} Q heads, {vllm_fwd.num_kv} KV heads, "
+                  f"dh={vllm_fwd.dh}")
+        else:
+            vllm_engine = None
+            vllm_fwd = None
+            model, tokenizer = load_model_and_tokenizer(model_path, device)
+            if device.type == "cuda":
+                for layer in model.model.layers:
+                    layer.mlp = torch.compile(layer.mlp, mode="reduce-overhead")
+                print(f"[torch.compile] Compiled {len(model.model.layers)} MLP layers")
+
+        if args.backend == "vllm":
+            num_layers   = vllm_fwd.num_layers
+            num_kv_heads = vllm_fwd.num_kv
+            head_dim     = vllm_fwd.dh
+        else:
+            cfg = model.config
+            num_layers   = cfg.num_hidden_layers
+            num_kv_heads = getattr(cfg, "num_key_value_heads",
+                                   cfg.num_attention_heads)
+            head_dim     = getattr(cfg, "head_dim",
+                                   cfg.hidden_size // cfg.num_attention_heads)
 
         tiers_list = build_tiers(head_dim)
         codebooks  = load_codebooks(cb_dir, num_layers,
@@ -725,9 +782,14 @@ def main():
                 # Dense baseline
                 if "dense" in args.modes:
                     print(f"  [T={T}] Dense ...")
-                    dr = measure_dense_decode(
-                        model, eval_ids, T,
-                        args.n_warm, args.n_meas, args.n_trials, device)
+                    if args.backend == "vllm":
+                        dr = measure_dense_vllm(
+                            vllm_fwd, eval_ids, T,
+                            args.n_warm, args.n_meas, device)
+                    else:
+                        dr = measure_dense_decode(
+                            model, eval_ids, T,
+                            args.n_warm, args.n_meas, args.n_trials, device)
                     dr["model"] = model_tag
                     dr["workload"] = "w1"
                     all_results.append(dr)
@@ -761,8 +823,10 @@ def main():
                     for bpt in args.budgets:
                         print(f"  [T={T}] {mode} @ {bpt:.0f} bpt ...")
                         from spherical_kv_pipeline import SphericalKVPipeline
+                        # Use raw vLLM model if backend=vllm (has .config)
+                        _model_for_pipeline = raw_model if args.backend == "vllm" else model
                         pipeline = SphericalKVPipeline(
-                            model=model, tokenizer=tokenizer,
+                            model=_model_for_pipeline, tokenizer=tokenizer,
                             codebooks=codebooks, device=device,
                             head_dim=head_dim,
                             group_size=_cfg.GROUP_SIZE,
@@ -781,10 +845,15 @@ def main():
                             saved_abl = apply_ablation_mode(mode, pipeline)
 
                         try:
-                            r = measure_sphkv_decode(
-                                mode, model, pipeline, eval_ids, T,
-                                args.n_warm, args.n_meas, args.n_trials,
-                                device, bpt_eff)
+                            if args.backend == "vllm":
+                                r = measure_sphkv_vllm(
+                                    vllm_fwd, pipeline, eval_ids, T,
+                                    args.n_warm, args.n_meas, bpt_eff, device)
+                            else:
+                                r = measure_sphkv_decode(
+                                    mode, model, pipeline, eval_ids, T,
+                                    args.n_warm, args.n_meas, args.n_trials,
+                                    device, bpt_eff)
 
                             r["model"] = model_tag
                             r["workload"] = "w1"
@@ -929,8 +998,8 @@ def main():
         model_dir = out_dir / model_tag
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        # TTFT
-        if "w1" in args.workloads:
+        # TTFT (skip for vLLM backend — model is None)
+        if "w1" in args.workloads and model is not None:
             print(f"\n  TTFT measurement ...")
             for T in args.context_lengths[:1]:  # first context length
                 max_T = T
@@ -958,10 +1027,10 @@ def main():
                     all_results.append({"type": "ttft", "mode": "sphkv",
                                         "model": model_tag, "T": T, **ttft_s})
 
-        # Head allocation (A3) + Segment profiles (A4)
+        # Head allocation (A3) + Segment profiles (A4) — skip for vLLM
         sphkv_w1 = [r for r in all_results
                     if r.get("mode") == "sphkv" and r.get("workload") == "w1"]
-        if sphkv_w1:
+        if sphkv_w1 and model is not None:
             T_last = args.context_lengths[0]
             needed = T_last + 64
             eval_ids_1d = _load_dataset_tokens(tokenizer, args.dataset, needed)
@@ -1003,7 +1072,7 @@ def main():
             pip_a.uninstall()
 
         # Full cost accounting + decode breakdown (Section 3.5 / 4.3)
-        if sphkv_w1:
+        if sphkv_w1 and model is not None:
             from hardware_audit import measure_full_cost, measure_decode_breakdown
             T_fc = args.context_lengths[0]
             needed_fc = T_fc + 64
