@@ -1,17 +1,7 @@
-"""
-Split-kernel decode with INLINE dot product (no Q-LUT precomputation).
-
-Per-layer hot path:
-  1. Encode new token (1 einsum + 1 argmax)
-  2. Append to pools (batched writes)
-  3. ONE kernel launch: inline dot product logits
-  4. Softmax (PyTorch)
-  5. V gather + matmul (cuBLAS)
-"""
 from __future__ import annotations
 import torch
 from typing import Dict
-from fused_decode import sphkv_logits
+from fused_decode import sphkv_decode, sphkv_encode_append
 
 
 def make_tier_idx_map(tiers) -> Dict[int, int]:
@@ -38,10 +28,8 @@ class LayerPool:
         self.dh = dh
         self.device = device
 
-        # g_max = max group size across tiers (for cb_flat padding)
         self.g_max = max(t.g for t in tiers if getattr(t, "tier_id", 0) != 0)
 
-        # ── Build pages from per_head_pages ──
         page_data = []
         head_blocks = {h: [] for h in range(num_kv)}
         ctx_lens = [0] * num_kv
@@ -71,13 +59,12 @@ class LayerPool:
                     theta_pg[:npg, :G_t] = theta_full[s:e].to(torch.uint8).to(device)
                     rad_pg[:npg, :G_t] = r_q.to(device)
                     rscl_pg[:G_t] = rscl.to(device)
-                    v_pg = torch.zeros(page_size, dh, dtype=torch.float32, device=device)
-                    v_pg[:npg] = V_tier[s:e].to(device).float()
+                    v_pg = torch.zeros(page_size, dh, dtype=torch.float16, device=device)
+                    v_pg[:npg] = V_tier[s:e].to(device).half()
                     pid = len(page_data)
                     page_data.append((theta_pg, rad_pg, rscl_pg, v_pg))
                     head_blocks[h].append((pid, t_idx))
                     n_tok += npg
-            # ctx_len = total SLOTS so kernel processes ALL pages
             ctx_lens[h] = len(head_blocks[h]) * page_size
 
         n_used = len(page_data)
@@ -87,11 +74,10 @@ class LayerPool:
         self.max_blocks = max_blk
         self.num_pages_used = n_used
 
-        # Pool tensors
         self.theta_codes = torch.zeros((n_total, page_size, G_max), dtype=torch.uint8, device=device)
         self.radius_codes = torch.zeros((n_total, page_size, G_max), dtype=torch.uint8, device=device)
         self.r_scales = torch.zeros((n_total, G_max), dtype=torch.float32, device=device)
-        self.v_pool = torch.zeros((n_total, page_size, dh), dtype=torch.float32, device=device)
+        self.v_pool = torch.zeros((n_total, page_size, dh), dtype=torch.float16, device=device)
 
         for pid, (t_pg, r_pg, rs_pg, v_pg) in enumerate(page_data):
             self.theta_codes[pid] = t_pg
@@ -99,7 +85,6 @@ class LayerPool:
             self.r_scales[pid] = rs_pg
             self.v_pool[pid] = v_pg
 
-        # Paging tables
         self.ctx_lens_cpu = list(ctx_lens)
         self.block_table_cpu = [[-1] * max_blk for _ in range(num_kv)]
         self.bits_table_cpu = [[0] * max_blk for _ in range(num_kv)]
@@ -112,14 +97,13 @@ class LayerPool:
         self.bits_table_gpu = torch.tensor(self.bits_table_cpu, dtype=torch.int32, device=device)
         self.ctx_lens_gpu = torch.tensor(self.ctx_lens_cpu, dtype=torch.int32, device=device)
 
-        # ── Pre-stack codebooks: [H_kv, num_tiers, G_max, cb_max, g_max] ──
-        # Kernel reads cb_flat[hkv, tier, g, code, :] for inline dot product
         num_tiers = len(tier_idx_map)
         self.cb_flat = torch.zeros(
             (num_kv, num_tiers, G_max, cb_size_max, self.g_max),
             dtype=torch.float32, device=device)
 
-        self.decode_cb = None  # tier 3 codebook for decode-token encoding
+        self.decode_cb = None
+        self._decode_cb_flat = None  # flattened for encode kernel
         from codebook_loader import get_codebook
         for tier_obj in tiers:
             tid = getattr(tier_obj, "tier_id", 0)
@@ -136,13 +120,12 @@ class LayerPool:
                     break
                 heads.append(cb.to(device).float())
             if len(heads) == num_kv:
-                stacked = torch.stack(heads)  # [H_kv, G, C, g]
-                # Write into cb_flat with proper padding
+                stacked = torch.stack(heads)
                 self.cb_flat[:, t_idx, :G, :C, :g] = stacked
                 if tid == 3:
-                    self.decode_cb = stacked
+                    self.decode_cb = stacked  # [num_kv, G, C, g]
+                    self._decode_cb_flat = stacked.contiguous()
 
-        # ── Tier parameter tensors (constant, on GPU) ──
         active_tiers = [t for t in tiers if getattr(t, "tier_id", 0) != 0]
         self.tier_G_gpu = torch.tensor(
             [t.G for t in active_tiers], dtype=torch.int32, device=device)
@@ -150,84 +133,74 @@ class LayerPool:
             [t.g for t in active_tiers], dtype=torch.int32, device=device)
 
         self._pids = torch.zeros(num_kv, dtype=torch.long, device=device)
-        self._slots = torch.zeros(num_kv, dtype=torch.long, device=device)
+        self._dec_tier_idx = tier_idx_map[3]
+
+        # Decode tier params (constant)
+        b_dec = next(t for t in tiers if getattr(t, "tier_id", 0) == 3)
+        self._G_dec = b_dec.G
+        self._g_dec = b_dec.g
+        self._C_dec = 2 ** b_dec.b_theta
+
+        # Pre-allocated scratch
+        self._out_buf = torch.zeros(num_q, dh, dtype=torch.float32, device=device)
+        self._partial_scratch = torch.zeros(num_q, max_blk, dh + 2,
+                                            dtype=torch.float32, device=device)
+        self._uniform_ctx = ctx_lens[0] if ctx_lens else 0
 
     def append_and_compute(self, q_post, k_post, v_new, tiers, sm_scale):
         device = self.device
-        num_kv = self.num_kv
-        b_dec = tiers[3]
-        G_dec, g_dec = b_dec.G, b_dec.g
 
-        # ── Encode new token ──
-        K_grp = k_post.float().view(num_kv, G_dec, g_dec)
-        r_real = K_grp.norm(dim=-1).clamp(min=1e-8)
-        K_dir = K_grp / r_real.unsqueeze(-1)
-        sims = torch.einsum('hgi,hgci->hgc', K_dir, self.decode_cb)
-        theta_all = sims.argmax(dim=-1).to(torch.uint8)
+        # ── Page management (pure CPU, ~2μs) ──
+        cur_len = self._uniform_ctx
+        slot = cur_len % self.page_size
+        is_new_page = (slot == 0)
 
-        # ── Append to pools ──
-        bt_dirty = False
-        for h_kv in range(num_kv):
-            cur_len = self.ctx_lens_cpu[h_kv]
+        if is_new_page:
             pg = cur_len // self.page_size
-            slot = cur_len % self.page_size
-            if slot == 0:
-                pid = self.num_pages_used
-                self.num_pages_used += 1
-                self.block_table_cpu[h_kv][pg] = pid
-                self.bits_table_cpu[h_kv][pg] = self.tier_idx_map[b_dec.tier_id]
-                bt_dirty = True
-                self.r_scales[pid, :G_dec] = r_real[h_kv]
-            else:
-                pid = self.block_table_cpu[h_kv][pg]
-            self._pids[h_kv] = pid
-            self._slots[h_kv] = slot
-            self.ctx_lens_cpu[h_kv] = cur_len + 1
-
-        cur_scales = self.r_scales[self._pids, :G_dec]
-        r_q_all = (r_real / cur_scales * 255.0).round().clamp(0, 255).to(torch.uint8)
-        self.theta_codes[self._pids, self._slots, :G_dec] = theta_all
-        self.radius_codes[self._pids, self._slots, :G_dec] = r_q_all
-        self.v_pool[self._pids, self._slots, :] = v_new.float()
-
-        if bt_dirty:
+            start_pid = self.num_pages_used
+            self.num_pages_used += self.num_kv
+            for h in range(self.num_kv):
+                self.block_table_cpu[h][pg] = start_pid + h
+                self.bits_table_cpu[h][pg] = self._dec_tier_idx
             self.block_table_gpu = torch.tensor(
                 self.block_table_cpu, dtype=torch.int32, device=device)
             self.bits_table_gpu = torch.tensor(
                 self.bits_table_cpu, dtype=torch.int32, device=device)
-        self.ctx_lens_gpu = torch.tensor(
-            self.ctx_lens_cpu, dtype=torch.int32, device=device)
+            self._pids[:] = torch.arange(start_pid, start_pid + self.num_kv,
+                                         dtype=torch.long, device=device)
 
-        # ── Logit kernel (inline dot product, no Q-LUT) ──
-        max_ctx = max(self.ctx_lens_cpu)
+        self._uniform_ctx = cur_len + 1
+
+        # ── Dispatch 1: fused encode + append (1 kernel, replaces 12 ops) ──
+        sphkv_encode_append(
+            k_post, v_new, self._decode_cb_flat,
+            self.theta_codes, self.radius_codes,
+            self.r_scales, self.v_pool,
+            self._pids,
+            slot, self._G_dec, self._g_dec, self._C_dec,
+            self.G_max, self.dh, self.page_size,
+            1 if is_new_page else 0,
+        )
+
+        # ── Dispatch 2: update ctx_lens (in-place, tiny) ──
+        self.ctx_lens_gpu.add_(1)
+
+        # ── Dispatch 3: fused decode (2 kernels internally) ──
+        max_ctx = self._uniform_ctx
         num_tiers = len(self.tier_idx_map)
-        logits = torch.full((self.num_q, max_ctx), -1e9,
-                            dtype=torch.float32, device=device)
 
-        sphkv_logits(
-            q_post,                 # [H_q, dh] — raw Q vector
-            self.cb_flat,           # [H_kv, num_tiers, G_max, cb_max, g_max]
-            self.tier_G_gpu,        # [num_tiers]
-            self.tier_g_gpu,        # [num_tiers]
-            self.theta_codes,       # [P, page_size, G_max]
-            self.radius_codes,      # [P, page_size, G_max]
-            self.r_scales,          # [P, G_max]
-            self.block_table_gpu,   # [H_kv, max_blocks]
-            self.bits_table_gpu,    # [H_kv, max_blocks]
-            self.ctx_lens_gpu,      # [H_kv]
-            logits,                 # [H_q, max_ctx] output
+        sphkv_decode(
+            q_post, self.cb_flat,
+            self.tier_G_gpu, self.tier_g_gpu,
+            self.theta_codes, self.radius_codes,
+            self.r_scales, self.v_pool,
+            self.block_table_gpu, self.bits_table_gpu,
+            self.ctx_lens_gpu, self._out_buf,
+            self._partial_scratch,
             self.num_q, self.num_kv, self.kv_groups, num_tiers,
             self.max_blocks, self.page_size, self.dh,
             self.G_max, self.cb_size_max, self.g_max,
             sm_scale, max_ctx,
         )
 
-        # ── Softmax + V matmul ──
-        attn = torch.softmax(logits, dim=-1)
-        n_blocks_ctx = (max_ctx + self.page_size - 1) // self.page_size
-        page_ids = self.block_table_gpu[:, :n_blocks_ctx].long()
-        V_paged = self.v_pool[page_ids]
-        V_flat = V_paged.reshape(self.num_kv, -1, self.dh)[:, :max_ctx, :]
-        attn_grouped = attn.view(self.num_kv, self.kv_groups, max_ctx)
-        out = torch.einsum('hgn,hnd->hgd', attn_grouped, V_flat)
-        return out.reshape(self.num_q, self.dh)
+        return self._out_buf

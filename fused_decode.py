@@ -9,23 +9,33 @@ fused_decode_cuda = _load_ext(
     verbose=True,
 )
 
-def sphkv_logits(q_all, cb_flat, tier_G, tier_g,
-                 theta_codes, radius_codes, r_scales,
-                 block_table, bits_table, ctx_lens, logits_out,
+def sphkv_decode(q_all, cb_flat, tier_G, tier_g,
+                 theta_codes, radius_codes, r_scales, v_pool,
+                 block_table, bits_table, ctx_lens, out,
+                 partial_scratch,
                  num_q_heads, num_kv_heads, kv_groups, num_tiers,
                  max_blocks, page_size, dh, G_max, cb_max, g_max,
                  sm_scale, max_ctx):
     fused_decode_cuda.forward(
-        q_all.contiguous(), cb_flat.contiguous(),
-        tier_G.contiguous(), tier_g.contiguous(),
-        theta_codes.contiguous(), radius_codes.contiguous(),
-        r_scales.contiguous(), block_table.contiguous(),
-        bits_table.contiguous(), ctx_lens.contiguous(),
-        logits_out.contiguous(),
+        q_all, cb_flat, tier_G, tier_g,
+        theta_codes, radius_codes, r_scales, v_pool,
+        block_table, bits_table, ctx_lens, out, partial_scratch,
         num_q_heads, num_kv_heads, kv_groups, num_tiers,
         max_blocks, page_size, dh, G_max, cb_max, g_max,
         sm_scale, max_ctx)
-    return logits_out
+    return out
 
+def sphkv_encode_append(k_post, v_new, decode_cb,
+                        theta_codes, radius_codes, r_scales, v_pool,
+                        pids, slot, G, g, C, G_max, dh, page_size,
+                        is_new_page):
+    fused_decode_cuda.encode_append(
+        k_post, v_new, decode_cb,
+        theta_codes, radius_codes, r_scales, v_pool,
+        pids, slot, G, g, C, G_max, dh, page_size, is_new_page)
+
+# Backwards compat
+def sphkv_logits(*a, **k):
+    return sphkv_decode(*a, **k)
 def fused_decode(*a, **k):
-    return sphkv_logits(*a, **k)
+    return sphkv_decode(*a, **k)
