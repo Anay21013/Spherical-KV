@@ -75,4 +75,12 @@ def _decode_proxy(token, tier) -> float:
     lam_th = LAMBDA_THETA.get(tier.tier_id, 0.10)
 
     delta_i = _INV_SQRT_D * r_sum * (lam_r + lam_th)
-    return token.omega * delta_i
+
+    # Segment-aware weighting (paper §3.3 retrieved-block protocol).
+    # When reuse/stability are unavailable (cold-start prefill via vLLM path),
+    # we still need segment priority so the controller protects retrieved
+    # evidence from being downgraded before prefix tokens.
+    seg_w = SEGMENT_WEIGHTS.get(token.segment_id, 1.0)
+    # Importance floor ensures segment weights matter even at omega=0.
+    importance = max(float(token.omega), 0.1)
+    return seg_w * importance * delta_i

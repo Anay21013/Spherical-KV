@@ -528,10 +528,10 @@ def allocate(tokens: list, tiers: list,
     for tok in sinks:
         tok.assign_tier_protected(b1.tier_id)
     for tok in recents:
-        tok.assign_tier_protected(b3.tier_id)
+        tok.assign_tier_protected(b1.tier_id)
  
     prot_bits = (sum(_effective_bits(b1) for _ in sinks) +
-                 sum(_effective_bits(b3) for _ in recents))
+                 sum(_effective_bits(b1) for _ in recents))
     B_eff = _cfg.GLOBAL_BUDGET_BITS - prot_bits
  
     if B_eff <= 0:
@@ -592,10 +592,10 @@ def online_refresh(retained_tokens: list, tiers: list,
     for tok in sinks:
         tok.assign_tier_protected(b1.tier_id)
     for tok in recents:
-        tok.assign_tier_protected(b3.tier_id)
+        tok.assign_tier_protected(b1.tier_id)
  
     prot_bits = (sum(_effective_bits(b1) for _ in sinks) +
-                 sum(_effective_bits(b3) for _ in recents))
+                 sum(_effective_bits(b1) for _ in recents))
     B_eff = _cfg.GLOBAL_BUDGET_BITS - prot_bits
  
     if B_eff <= 0:

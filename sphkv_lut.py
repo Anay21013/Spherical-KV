@@ -122,7 +122,7 @@ class LayerPool:
             if len(heads) == num_kv:
                 stacked = torch.stack(heads)
                 self.cb_flat[:, t_idx, :G, :C, :g] = stacked
-                if tid == 3:
+                if tid == 1:                              # FIXED: was 3 (recent->b1)
                     self.decode_cb = stacked  # [num_kv, G, C, g]
                     self._decode_cb_flat = stacked.contiguous()
 
@@ -133,10 +133,10 @@ class LayerPool:
             [t.g for t in active_tiers], dtype=torch.int32, device=device)
 
         self._pids = torch.zeros(num_kv, dtype=torch.long, device=device)
-        self._dec_tier_idx = tier_idx_map[3]
+        self._dec_tier_idx = tier_idx_map[1]   # recent tokens go to b1 (paper §C.1)
 
         # Decode tier params (constant)
-        b_dec = next(t for t in tiers if getattr(t, "tier_id", 0) == 3)
+        b_dec = next(t for t in tiers if getattr(t, "tier_id", 0) == 1)   # FIXED: recent->b1
         self._G_dec = b_dec.G
         self._g_dec = b_dec.g
         self._C_dec = 2 ** b_dec.b_theta

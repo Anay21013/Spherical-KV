@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -672,13 +673,15 @@ def parse_args():
                    help="Backend: 'hf' (HuggingFace) or 'vllm' (vLLM optimized serving)")
 
     # W2 options
-    p.add_argument("--w2_task", default="hotpotqa",
-                   choices=["hotpotqa", "2wikimqa"])
+    p.add_argument("--w2_tasks", nargs="+",
+                   default=["hotpotqa", "2wikimqa", "musique",
+                            "multifieldqa_en", "qasper", "narrativeqa"],
+                   help="LongBench retrieval tasks for W2")
     p.add_argument("--w2_max_samples", type=int, default=50)
-    p.add_argument("--w2_distractors", type=int, nargs="+", default=[0, 3, 5],
+    p.add_argument("--w2_distractors", type=int, nargs="+", default=[0],
                    help="Distractor counts for W2 sweep")
     p.add_argument("--w2_positions", nargs="+",
-                   default=["early", "middle", "late"],
+                   default=["natural"],
                    help="Answer positions for W2 sweep")
 
     # W3 options
@@ -729,6 +732,7 @@ def main():
         else:
             vllm_engine = None
             vllm_fwd = None
+            raw_model = None
             model, tokenizer = load_model_and_tokenizer(model_path, device)
             if device.type == "cuda":
                 for layer in model.model.layers:
@@ -870,53 +874,179 @@ def main():
 
         if "w2" in args.workloads:
             print(f"\n{'='*60}")
-            print(f"  W2: Retrieval QA ({args.w2_task})")
+            print(f"  W2: Retrieval QA (LongBench)")
+            print(f"  Tasks: {args.w2_tasks}")
+            print(f"  Context lengths: {sorted(args.context_lengths)}")
             print(f"{'='*60}")
 
             from dataset_w2 import load_longbench_dataset, evaluate_w2
 
             try:
-                w2_samples = load_longbench_dataset(
-                    task=args.w2_task, max_samples=args.w2_max_samples)
+                _w2_model = model
+                if _w2_model is None and raw_model is not None:
+                    _w2_model = raw_model
+                _w2_vllm = vllm_fwd if args.backend == "vllm" else None
 
-                for n_dist in args.w2_distractors:
-                    for pos in args.w2_positions:
-                        print(f"\n  distractors={n_dist}  position={pos}")
+                w2_contexts = sorted(args.context_lengths) if args.context_lengths else [8192]
 
-                        # Dense
-                        if "dense" in args.modes:
-                            w2r = evaluate_w2(
-                                model, tokenizer, None, w2_samples,
-                                device, mode="dense",
-                                n_distractors=n_dist,
-                                answer_position=pos)
-                            w2r["model"] = model_tag
-                            w2r["workload"] = "w2"
-                            all_results.append(w2r)
-                            print(f"    Dense:  EM={w2r['em']:.3f} "
-                                  f"F1={w2r['f1']:.3f}")
+                for T_max in w2_contexts:
+                    print(f"\n  {'─'*50}")
+                    print(f"  Context L={T_max}")
+                    print(f"  {'─'*50}")
 
-                        # SphKV
-                        if "sphkv" in args.modes:
-                            from spherical_kv_pipeline import SphericalKVPipeline
-                            pip_w2 = SphericalKVPipeline(
-                                model=model, tokenizer=tokenizer,
-                                codebooks=codebooks, device=device,
-                                head_dim=head_dim,
-                                group_size=_cfg.GROUP_SIZE,
-                                sink_tokens=_cfg.SINK_TOKENS,
-                                use_fused=(device.type == "cuda"))
-                            w2r = evaluate_w2(
-                                model, tokenizer, pip_w2, w2_samples,
-                                device, mode="sphkv",
-                                n_distractors=n_dist,
-                                answer_position=pos)
-                            w2r["model"] = model_tag
-                            w2r["workload"] = "w2"
-                            all_results.append(w2r)
-                            print(f"    SphKV:  EM={w2r['em']:.3f} "
-                                  f"F1={w2r['f1']:.3f}  "
-                                  f"seg_ret={w2r.get('seg_retention',{})}")
+                    # Collect samples across all tasks at this context length
+                    all_task_samples = {}
+                    for task in args.w2_tasks:
+                        try:
+                            samps = load_longbench_dataset(
+                                task=task,
+                                max_samples=args.w2_max_samples,
+                                tokenizer=tokenizer,
+                                max_context_tokens=T_max)
+                            if samps:
+                                all_task_samples[task] = samps
+                        except Exception as te:
+                            print(f"    {task}: load failed ({te})")
+
+                    if not all_task_samples:
+                        print(f"  No samples fit in L={T_max}, skipping")
+                        continue
+
+                    total_samples = sum(len(v) for v in all_task_samples.values())
+                    print(f"  Total: {total_samples} samples across "
+                          f"{len(all_task_samples)} tasks")
+
+                    for n_dist in args.w2_distractors:
+                        for pos in args.w2_positions:
+
+                            # ── Dense: run per-task, aggregate ──
+                            Q_dense = None
+                            dense_ems, dense_f1s = [], []
+                            if "dense" in args.modes:
+                                if _w2_model is None and _w2_vllm is None:
+                                    print("    SKIP dense: no model")
+                                else:
+                                    for task, samps in all_task_samples.items():
+                                        w2r = evaluate_w2(
+                                            _w2_model, tokenizer, None, samps,
+                                            device, mode="dense",
+                                            n_distractors=n_dist,
+                                            answer_position=pos,
+                                            vllm_fwd=_w2_vllm,
+                                            vllm_engine=vllm_engine)
+                                        w2r["model"] = model_tag
+                                        w2r["T"] = T_max
+                                        w2r["task"] = task
+                                        all_results.append(w2r)
+                                        dense_ems.extend(w2r["em_all"])
+                                        dense_f1s.extend(w2r["f1_all"])
+                                        print(f"    Dense {task}: "
+                                              f"EM={w2r['em']*100:.1f}%  "
+                                              f"F1={w2r['f1']*100:.1f}%  "
+                                              f"({len(samps)} samples)")
+
+                                    # Aggregate across tasks
+                                    if dense_f1s:
+                                        agg_em = sum(dense_ems) / len(dense_ems)
+                                        agg_f1 = sum(dense_f1s) / len(dense_f1s)
+                                        Q_dense = agg_f1 * 100
+                                        agg_r = {
+                                            "model": model_tag, "mode": "dense",
+                                            "workload": "w2", "T": T_max,
+                                            "task": "ALL",
+                                            "em": agg_em, "f1": agg_f1,
+                                            "Q": Q_dense,
+                                            "tok_s": w2r.get("tok_s", 0),
+                                            "bKV": w2r.get("bKV", 0),
+                                            "n_samples": len(dense_f1s),
+                                        }
+                                        all_results.append(agg_r)
+                                        print(f"    ── Dense ALL L={T_max}: "
+                                              f"Q={Q_dense:.1f}%  "
+                                              f"EM={agg_em*100:.1f}%  "
+                                              f"({len(dense_f1s)} total)")
+
+                            # ── SphKV: run per-task, aggregate ──
+                            if "sphkv" in args.modes:
+                                if _w2_model is None and _w2_vllm is None:
+                                    print("    SKIP sphkv: no model")
+                                else:
+                                    for bpt in args.budgets:
+                                        sphkv_ems, sphkv_f1s = [], []
+                                        last_w2r = None
+
+                                        for task, samps in all_task_samples.items():
+                                            from spherical_kv_pipeline import SphericalKVPipeline
+                                            pip_w2 = SphericalKVPipeline(
+                                                model=_w2_model or raw_model,
+                                                tokenizer=tokenizer,
+                                                codebooks=codebooks, device=device,
+                                                head_dim=head_dim,
+                                                group_size=_cfg.GROUP_SIZE,
+                                                sink_tokens=_cfg.SINK_TOKENS,
+                                                use_fused=(device.type == "cuda"))
+
+                                            w2r = evaluate_w2(
+                                                _w2_model, tokenizer, pip_w2,
+                                                samps, device, mode="sphkv",
+                                                n_distractors=n_dist,
+                                                answer_position=pos,
+                                                budget_bpt=bpt,
+                                                vllm_fwd=_w2_vllm)
+                                            w2r["model"] = model_tag
+                                            w2r["T"] = T_max
+                                            w2r["task"] = task
+                                            w2r["budget_bpt"] = bpt
+                                            if Q_dense is not None:
+                                                w2r["Q_dense"] = Q_dense
+                                                w2r["delta_Q"] = Q_dense - w2r["Q"]
+                                            all_results.append(w2r)
+                                            sphkv_ems.extend(w2r["em_all"])
+                                            sphkv_f1s.extend(w2r["f1_all"])
+                                            last_w2r = w2r
+                                            print(f"    SphKV@{bpt:.0f} {task}: "
+                                                  f"EM={w2r['em']*100:.1f}%  "
+                                                  f"F1={w2r['f1']*100:.1f}%  "
+                                                  f"({len(samps)} samples)")
+
+                                            gc.collect()
+                                            torch.cuda.empty_cache()
+
+                                        # Aggregate
+                                        if sphkv_f1s:
+                                            agg_em = sum(sphkv_ems) / len(sphkv_ems)
+                                            agg_f1 = sum(sphkv_f1s) / len(sphkv_f1s)
+                                            Q_sphkv = agg_f1 * 100
+                                            dQ = (Q_dense - Q_sphkv) if Q_dense else 0
+                                            # Aggregate segment counts across tasks
+                                            agg_seg = {}
+                                            for tr in all_results:
+                                                if (tr.get('mode') == 'sphkv'
+                                                        and tr.get('T') == T_max
+                                                        and tr.get('budget_bpt') == bpt
+                                                        and tr.get('task') != 'ALL'
+                                                        and tr.get('segment_tier_counts')):
+                                                    for k, v in tr['segment_tier_counts'].items():
+                                                        if isinstance(k, tuple):
+                                                            agg_seg[k] = agg_seg.get(k, 0) + v
+                                            agg_r = {
+                                                "model": model_tag, "mode": "sphkv",
+                                                "workload": "w2", "T": T_max,
+                                                "task": "ALL", "budget_bpt": bpt,
+                                                "em": agg_em, "f1": agg_f1,
+                                                "Q": Q_sphkv, "delta_Q": dQ,
+                                                "Q_dense": Q_dense,
+                                                "tok_s": last_w2r.get("tok_s", 0) if last_w2r else 0,
+                                                "bKV": last_w2r.get("bKV", 0) if last_w2r else 0,
+                                                "hBM_per_tok": last_w2r.get("hBM_per_tok", 0) if last_w2r else 0,
+                                                "segment_tier_counts": agg_seg,
+                                                "n_samples": len(sphkv_f1s),
+                                            }
+                                            all_results.append(agg_r)
+                                            print(f"    ── SphKV@{bpt:.0f} ALL L={T_max}: "
+                                                  f"Q={Q_sphkv:.1f}%  "
+                                                  f"\u03b4Q={dQ:.2f}  "
+                                                  f"({len(sphkv_f1s)} total)")
 
             except Exception as e:
                 print(f"  W2 failed: {e}")
@@ -1186,7 +1316,7 @@ def main():
 
     for r in sorted(grand_results,
                     key=lambda x: (x.get("model",""), x.get("mode",""),
-                                   x.get("budget_bpt",0))):
+                                   x.get("budget_bpt") or 0)):
         if "nll" not in r or "mode" not in r:
             continue
         bpt_s = f"{r.get('budget_bpt',0):>7.0f}" if "budget_bpt" in r else "    ---"
@@ -1195,6 +1325,64 @@ def main():
               f"{r.get('workload',''):>3} {bpt_s} "
               f"{r['nll']:>8.4f} {ppl_val:>8.2f} "
               f"{r['tok_s']:>7.1f} {r.get('bKV',0):>8.0f}")
+
+
+    # ── W2 summary ──
+    w2_rows = [r for r in grand_results if r.get('workload') == 'w2' and 'Q' in r]
+    if w2_rows:
+        # Show aggregated (ALL tasks) rows first — this is Table 5
+        agg_rows = [r for r in w2_rows if r.get('task') == 'ALL']
+        if agg_rows:
+            print(f"\n  W2 Quality — Aggregated (Table 5 format)")
+            print(f"{'Model':<25} {'Mode':<8} {'L':>6} {'Budget':>7} {'Q(F1%)':>8} "
+                  f"{'EM%':>7} {'\u03b4Q':>6} {'tok/s':>7} {'bKV':>8} {'HBM/tok':>8} {'N':>5}")
+            print("-" * 105)
+            for r in sorted(agg_rows, key=lambda x: (x.get('T',0), x.get('mode',''), x.get('budget_bpt') or 0)):
+                bpt_s = f"{r.get('budget_bpt',0):>7.0f}" if r.get('budget_bpt') else "    ---"
+                dq_s = f"{r.get('delta_Q',0):>6.2f}" if 'delta_Q' in r else "   ---"
+                T_s = f"{r.get('T',0):>6}"
+                print(f"{r.get('model',''):25s} {r['mode']:<8} "
+                      f"{T_s} {bpt_s} {r['Q']:>7.1f}% {r['em']*100:>6.1f}% {dq_s} "
+                      f"{r.get('tok_s',0):>7.1f} {r.get('bKV',0):>8.0f} "
+                      f"{r.get('hBM_per_tok',0):>8.0f} {r.get('n_samples',0):>5}")
+
+        # Per-task breakdown
+        task_rows = [r for r in w2_rows if r.get('task') != 'ALL']
+        if task_rows:
+            print(f"\n  W2 Quality — Per-task breakdown")
+            print(f"{'Task':<20} {'Mode':<8} {'L':>6} {'Budget':>7} {'Q(F1%)':>8} "
+                  f"{'EM%':>7} {'N':>5}")
+            print("-" * 75)
+            for r in sorted(task_rows, key=lambda x: (x.get('T',0), x.get('task',''), x.get('mode',''))):
+                bpt_s = f"{r.get('budget_bpt',0):>7.0f}" if r.get('budget_bpt') else "    ---"
+                print(f"{r.get('task',''):20s} {r['mode']:<8} "
+                      f"{r.get('T',0):>6} {bpt_s} {r['Q']:>7.1f}% "
+                      f"{r['em']*100:>6.1f}% {r.get('n_samples',0):>5}")
+
+        # Segment-wise tier breakdown (paper §3.3 controller evidence)
+        sphkv_agg = [r for r in agg_rows
+                     if r.get('mode') == 'sphkv' and r.get('segment_tier_counts')]
+        if sphkv_agg:
+            print(f"\n  W2 Segment-wise Retention + Tiering (paper §3.3)")
+            for r in sphkv_agg:
+                tag = f"L={r.get('T','?')} bpt={r.get('budget_bpt','?'):.0f}"
+                print(f"\n  {tag}:")
+                if r.get('segment_tier_table'):
+                    print(r['segment_tier_table'])
+                else:
+                    # Reconstruct from raw counts
+                    counts = r['segment_tier_counts']
+                    segs = {}
+                    for (seg, tid), n in counts.items():
+                        if isinstance(seg, str):
+                            segs.setdefault(seg, {})[tid] = n
+                    print(f"    {'Segment':<10} {'b1':>8} {'b2':>8} {'b3':>8} {'Total':>8}")
+                    for seg_name in ["prefix", "retrieved", "recent"]:
+                        d = segs.get(seg_name, {})
+                        b1, b2, b3 = d.get(1, 0), d.get(2, 0), d.get(3, 0)
+                        total = b1 + b2 + b3
+                        if total > 0:
+                            print(f"    {seg_name:<10} {b1:>8} {b2:>8} {b3:>8} {total:>8}")
 
     print(f"\nAll outputs -> {out_dir}")
 

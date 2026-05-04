@@ -9,12 +9,8 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple
 
 
-# ---------------------------------------------------------------------------
-#  Model loading
-# ---------------------------------------------------------------------------
-
 def load_vllm_model(model_name: str, dtype: str = "float16",
-                    gpu_mem: float = 0.85, max_model_len: int = 131072):
+                    gpu_mem: float = 0.65, max_model_len: int = 16384):
     """Load model via vLLM, return engine + raw model + config."""
     from vllm import LLM
     llm = LLM(
@@ -83,16 +79,7 @@ def _get_model_parts(raw_model):
     }
 
 
-# ---------------------------------------------------------------------------
-#  Direct model forward (bypasses vLLM scheduling, uses vLLM layers)
-# ---------------------------------------------------------------------------
-
 class VLLMDirectForward:
-    """
-    Runs vLLM model layers directly for decode.
-    Uses vLLM's optimized MLP/RMSNorm/embeddings.
-    Attention is either dense (SDPA) or compressed (our kernel).
-    """
     def __init__(self, raw_model, device):
         parts = _get_model_parts(raw_model)
         self.embed_tokens = parts['embed_tokens']
@@ -120,10 +107,6 @@ class VLLMDirectForward:
 
     @torch.no_grad()
     def prefill_capture(self, input_ids: torch.Tensor):
-        """
-        Run prefill using vLLM layers + dense SDPA attention.
-        Captures post-RoPE K and V for each layer.
-        """
         B, T = input_ids.shape
         hidden = self.embed_tokens(input_ids)  # [B, T, hidden]
         positions = torch.arange(T, device=self.device).unsqueeze(0)  # [1, T]
@@ -362,10 +345,6 @@ def _apply_rotary_emb(q, k, cos, sin):
 
     return q_rot, k_rot
 
-
-# ---------------------------------------------------------------------------
-#  Measurement functions
-# ---------------------------------------------------------------------------
 
 def measure_dense_vllm(vllm_fwd: VLLMDirectForward, eval_ids, T,
                        n_warm, n_meas, device):
