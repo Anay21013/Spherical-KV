@@ -10,7 +10,7 @@ from config import (
 
 SEGMENT_WEIGHTS = {
     0: 1.0,   # prefix
-    1: 1.5,   # retrieved evidence -- up-weighted
+    1: 3,   # retrieved evidence -- up-weighted
     2: 1.2,   # recent suffix
 }
 
@@ -31,10 +31,8 @@ def compute_distortion(
                          and r_max is not None)
 
     if use_prefill_proxy:
-        # Algorithm 1 lines 28-37.  No stickiness -- first-time allocation.
         return _prefill_proxy(token, tier, r_max, reuse, stability)
     else:
-        # C.2 decode proxy + C.4 stickiness (decode-time only)
         dist = _decode_proxy(token, tier)
         if GAMMA > 0.0 and tier.tier_id != token.new_tier_id:
             dist += GAMMA
@@ -65,7 +63,6 @@ def _decode_proxy(token, tier) -> float:
     if G_b == G_fine:
         r_sum = float(r.abs().sum())
     elif G_b < G_fine:
-        # Coarsen: sum adjacent pairs (e.g. b3: G_b=4, G_fine=8)
         r_t   = r.float()
         r_sum = float((r_t[0::2] + r_t[1::2]).abs().sum())
     else:
@@ -76,11 +73,6 @@ def _decode_proxy(token, tier) -> float:
 
     delta_i = _INV_SQRT_D * r_sum * (lam_r + lam_th)
 
-    # Segment-aware weighting (paper §3.3 retrieved-block protocol).
-    # When reuse/stability are unavailable (cold-start prefill via vLLM path),
-    # we still need segment priority so the controller protects retrieved
-    # evidence from being downgraded before prefix tokens.
     seg_w = SEGMENT_WEIGHTS.get(token.segment_id, 1.0)
-    # Importance floor ensures segment weights matter even at omega=0.
     importance = max(float(token.omega), 0.1)
     return seg_w * importance * delta_i

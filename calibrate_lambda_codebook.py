@@ -1,8 +1,3 @@
-"""
-Usage:
-    python calibrate_lambda_codebook.py --codebook_dir codebooks/codebooks_llama_1b --model_name_or_path meta-llama/Llama-3.2-1B --n_samples 512 --output_dir calibration_codebook_results
-"""
-
 import argparse
 import json
 import math
@@ -32,15 +27,6 @@ def parse_args():
 
 def compute_angular_errors(codebooks, num_layers, num_kv_heads, tiers,
                            n_samples=512, seed=42):
-    """
-    Compute epsilon_theta(b) per tier: mean angular error from VQ.
-
-    Returns:
-        eps_theta:      {tier_id: mean angular error in radians}
-        tier_all_angles:{tier_id: flat list of ALL individual angle samples}
-        layer_errors:   {tier_id: {layer_idx: [per-group mean errors]}}
-        total_measurements: int
-    """
     rng = torch.Generator()
     rng.manual_seed(seed)
     nondrop = [t for t in tiers if t.tier_id != 0]

@@ -87,9 +87,6 @@ def _estimate_hbm_bandwidth(gpu_name: str) -> str:
     return "unknown"
 
 
-# =========================================================================
-# 2. ncu Wrapper for DRAM Byte Counters
-# =========================================================================
 
 def measure_hbm_via_ncu(
     script_path: str,
@@ -97,12 +94,6 @@ def measure_hbm_via_ncu(
     nvtx_filter: str = "angle_logits",
     output_file: str = "ncu_report.csv",
 ) -> Optional[dict]:
-    """
-    Run Nsight Compute to measure DRAM read/write bytes.
-    Returns dict with dram_bytes_read, dram_bytes_write, bHBM.
-
-    Requires ncu to be installed and in PATH.
-    """
     cmd = (
         f"ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum "
         f"--nvtx --nvtx-include {nvtx_filter} "
@@ -153,17 +144,8 @@ def generate_ncu_command(script: str, args: str = "") -> str:
     )
 
 
-# =========================================================================
-# 3. T_decode Breakdown via NVTX Ranges
-# =========================================================================
 
 class DecodeBreakdown:
-    """
-    Collect per-component timing for the decode critical path:
-    T_decode = T_page_lookup + T_KV_read + T_similarity + T_softmax + T_proj + T_misc
-
-    Uses CUDA events paired with NVTX ranges for profiling.
-    """
     def __init__(self, device: torch.device):
         self.device = device
         self.is_cuda = device.type == "cuda"
@@ -217,10 +199,6 @@ def measure_decode_breakdown(
     model, pipeline, prefill_ids: torch.Tensor,
     n_steps: int = 16, device: torch.device = None,
 ) -> dict:
-    """
-    Measure T_decode component breakdown for Section 4.3.
-    Returns per-component mean ms.
-    """
     if device is None:
         device = prefill_ids.device
 
@@ -242,9 +220,6 @@ def measure_decode_breakdown(
     return breakdown.summary()
 
 
-# =========================================================================
-# 4. Roofline Analysis
-# =========================================================================
 
 def compute_roofline(
     achieved_bytes_per_tok: float,
@@ -252,12 +227,6 @@ def compute_roofline(
     peak_bw_GBs:            float,
     model_params_B:         float = 8.0,
 ) -> dict:
-    """
-    Compute roofline metrics for Section 4.3 microbench panel.
-
-    achieved_bw = achieved_bytes_per_tok * achieved_tok_s
-    utilization = achieved_bw / peak_bw
-    """
     achieved_bw = achieved_bytes_per_tok * achieved_tok_s / 1e9  # GB/s
     utilization = achieved_bw / max(peak_bw_GBs, 1e-9)
 
@@ -268,10 +237,6 @@ def compute_roofline(
         "memory_bound":      utilization > 0.3,  # rough threshold
     }
 
-
-# =========================================================================
-# 5. Full Cost Accounting
-# =========================================================================
 
 @torch.no_grad()
 def measure_full_cost(

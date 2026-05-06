@@ -112,6 +112,10 @@ class VLLMDirectForward:
         positions = torch.arange(T, device=self.device).unsqueeze(0)  # [1, T]
 
         kv_pairs = []
+        per_layer_reuse_q: list = []   
+        per_layer_head_out_last: list = []   # each: [B, num_q, dh] cpu
+
+        inv_sqrt_dh = 1.0 / math.sqrt(self.dh)
 
         for i, layer in enumerate(self.layers):
             residual = hidden
@@ -136,8 +140,26 @@ class VLLMDirectForward:
                 k.cpu(),   # [1, num_kv, T, dh]
                 v.cpu(),
             ))
+            q_last = q[:, :, -1, :]                           # [B, n
+            if self.num_q != self.num_kv:
+                grp = self.num_q // self.num_kv
+                k_for_proxy = k.unsqueeze(2).expand(
+                    B, self.num_kv, grp, T, self.dh
+                ).reshape(B, self.num_q, T, self.dh)
+            else:
+                k_for_proxy = k
+            # logits: [B, num_q, T]  (each q_head's logit row over keys)
+            logits_last = torch.einsum(
+                'bhd,bhtd->bht', q_last, k_for_proxy
+            ) * inv_sqrt_dh
+            # Causal-aware: at the last position, all keys [0..T-1] are visible.
+            attn_last = torch.softmax(logits_last, dim=-1)    # [B, num_q, T]
+            # Per-q-head std across tokens — concentration measure
+            reuse_q = attn_last.std(dim=-1).squeeze(0)        # [num_q]
+            per_layer_reuse_q.append(reuse_q.cpu())
+            del q_last, k_for_proxy, logits_last, attn_last
 
-            # Dense SDPA attention for prefill
+            # Dense SDPA attention for prefill (unchanged)
             if self.num_q != self.num_kv:
                 grp = self.num_q // self.num_kv
                 k_exp = k.unsqueeze(2).expand(B, self.num_kv, grp, T, self.dh)
@@ -148,7 +170,10 @@ class VLLMDirectForward:
                 k_exp, v_exp = k, v
 
             attn_out = F.scaled_dot_product_attention(
-                q, k_exp, v_exp, is_causal=True)  # [B, num_q, T, dh]
+                q, k_exp, v_exp, is_causal=True)  
+            per_layer_head_out_last.append(
+                attn_out[:, :, -1, :].detach().cpu()              # [B, num_q, dh]
+            )
 
             attn_out = attn_out.transpose(1, 2).reshape(B, T, -1)  # [B, T, hidden]
             attn_out, _ = layer.self_attn.o_proj(attn_out)
@@ -163,6 +188,8 @@ class VLLMDirectForward:
 
         hidden = self.norm(hidden)
         logits = F.linear(hidden, self.lm_head_weight)  # [B, T, vocab]
+        # Stash per-layer reuse so caller can pass it to pipeline.prefill
+        self._last_prefill_reuse_q = per_layer_reuse_q
         return kv_pairs, logits
 
     @torch.no_grad()
@@ -408,9 +435,12 @@ def measure_sphkv_vllm(vllm_fwd: VLLMDirectForward, pipeline,
         K_t = K_post.permute(0, 2, 1, 3).contiguous().view(B, Tlen, H * D)
         post_rope_K_list.append(K_t)
 
-    # Dummy attention weights (we use real attention in prefill hooks)
-    attn_w = [None] * vllm_fwd.num_layers
-    ho = [None] * vllm_fwd.num_layers
+    # Path A: pass per-(layer, q_head) reuse proxy captured during prefill
+    attn_w = list(getattr(vllm_fwd, '_last_prefill_reuse_q', None)
+                  or [None] * vllm_fwd.num_layers)
+    # s_hat: per-(layer, q_head) attention output at last query position
+    ho = list(getattr(vllm_fwd, '_last_prefill_head_out', None)
+              or [None] * vllm_fwd.num_layers)
 
     # Set budget via config (same as HF path)
     import config as _cfg
@@ -424,6 +454,7 @@ def measure_sphkv_vllm(vllm_fwd: VLLMDirectForward, pipeline,
         head_outputs=ho,
         pre_rope_K_list=post_rope_K_list,
         seq_len=T,
+        prefill_logits=prefill_logits,
         skip_patch=True,
     )
 

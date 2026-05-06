@@ -40,10 +40,6 @@ DEFAULT_TOOL_SCHEMA = [
 
 
 def mock_tool_response(tool_name: str, args: dict) -> str:
-    """
-    Deterministic mock tool responses for reproducibility.
-    Paper: 'deterministic tool responses when possible'
-    """
     if tool_name == "search":
         query = args.get("query", "")
         return f"Search results for '{query}': Found 3 relevant documents. The most relevant states that {query} is a well-documented topic."
@@ -68,10 +64,6 @@ def load_toolbench_dataset(
     max_samples: int = 50,
     split:       str = "test",
 ) -> List[dict]:
-    """
-    Load ToolBench episodes.
-    Falls back to synthetic episodes if dataset unavailable.
-    """
     try:
         from datasets import load_dataset
         ds = load_dataset("ToolBench/ToolBench", split=split,
@@ -97,10 +89,6 @@ def load_agentbench_dataset(
     max_samples: int = 50,
     task:        str = "os",
 ) -> List[dict]:
-    """
-    Load AgentBench episodes.
-    Falls back to synthetic if unavailable.
-    """
     try:
         from datasets import load_dataset
         ds = load_dataset("THUDM/AgentBench", task, split="test",
@@ -123,14 +111,6 @@ def load_agentbench_dataset(
 
 
 def _make_synthetic_episodes(n: int) -> List[dict]:
-    """Generate synthetic multi-step tool-use episodes for testing.
-
-    Each task has a verifiable gold_answer.  This is essential — without
-    it, success reduces to "did the model emit any finish tool call?",
-    which is a meaningless metric (an instruction-tuned model that
-    immediately writes `{"tool": "finish", "args": {"answer": ""}}`
-    would score 100%).
-    """
     episodes = []
     tasks = [
         {"instruction": "Use the calculator to compute 12 * 7.",
@@ -154,8 +134,6 @@ def _make_synthetic_episodes(n: int) -> List[dict]:
         })
     print(f"[W3] Generated {n} synthetic episodes")
     return episodes
-
-# Agent episode runner
 
 AGENT_SYSTEM_PROMPT = """You are a helpful assistant with access to tools. \
 You MUST respond with exactly one JSON object per turn — nothing else, \
@@ -194,7 +172,6 @@ def _format_tools_desc(tools: List[dict]) -> str:
 
 
 def _parse_tool_call(text: str) -> Optional[Tuple[str, dict]]:
-    """Extract tool call from model output."""
     decoder = json.JSONDecoder()
     n = len(text)
     i = 0
@@ -215,7 +192,6 @@ def _parse_tool_call(text: str) -> Optional[Tuple[str, dict]]:
         else:
             i += 1
 
-    # Last-ditch fallback: a bare "tool: name" mention with no JSON.
     m = re.search(r'"?tool"?\s*[:=]\s*"?([A-Za-z_]\w*)"?', text)
     if m:
         return m.group(1), {}
@@ -235,12 +211,6 @@ def run_episode(
     mode:           str = "dense",
     seed:           int = 42,
 ) -> dict:
-    """
-    Run a single bounded-horizon agentic episode.
-
-    Returns trajectory (sequence of tool calls), final answer,
-    success flag, and total generated tokens.
-    """
     torch.manual_seed(seed)
 
     tools = episode.get("tools", DEFAULT_TOOL_SCHEMA)
@@ -336,15 +306,6 @@ def evaluate_w3(
     max_new_tokens: int = 128,
     n_seeds:        int = 3,
 ) -> dict:
-    """
-    Full W3 evaluation with stability metrics.
-
-    Runs each episode across multiple seeds to measure:
-    - Success rate (task completion)
-    - Trajectory sensitivity S_traj
-    - Length drift DeltaT
-    - Trajectory disagreement rate
-    """
     all_success = []
     all_n_steps = []
     all_total_tokens = []
@@ -410,9 +371,6 @@ def compute_w3_length_drift(
     dense_results: dict,
     sphkv_results: dict,
 ) -> dict:
-    """
-    DeltaT = E[|T_sphkv - T_dense|] across episodes.
-    """
     dense_tokens = dense_results.get("mean_tokens", 0)
     sphkv_tokens = sphkv_results.get("mean_tokens", 0)
     delta_t = abs(sphkv_tokens - dense_tokens)

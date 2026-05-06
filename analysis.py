@@ -17,10 +17,6 @@ def measure_ttft(
     n_trials:       int = 5,
     mode:           str = "dense",
 ) -> dict:
-    """
-    Measure prefill latency = time to first generated token.
-    Includes controller allocation time for SphericalKV.
-    """
     is_cuda = device.type == "cuda"
     times = []
 
@@ -62,13 +58,6 @@ def measure_ttft(
 
 
 def compute_head_allocation_stats(pipeline) -> dict:
-    """
-    Compute per-head average bytes/token and Gini coefficient.
-    Paper A3: tests whether gains rely on head-adaptive rate allocation.
-
-    a_h = (1/T) * sum_i bytes(z_{i,l,h}, t_{i,l,h})
-    Gini measures concentration of allocation across heads.
-    """
     from tiers import build_tiers
     tiers = build_tiers(pipeline.head_dim)
     tier_by_id = {t.tier_id: t for t in tiers}

@@ -56,12 +56,26 @@ void sphkv_encode_append_kernel(
 
         theta_codes[code_base + grp] = (uint8_t)best_code;
 
+        /* Per-page running-max radius scale (preserved bug-fix). */
         float r_scale;
         if (is_new_page) {
             r_scales[pid * G_max + grp] = norm;
             r_scale = norm;
         } else {
-            r_scale = r_scales[pid * G_max + grp];
+            float prev_scale = r_scales[pid * G_max + grp];
+            if (norm > prev_scale) {
+                float ratio = prev_scale / (norm + 1e-8f);
+                for (int t = 0; t < slot; t++) {
+                    uint8_t old_q = radius_codes[(pid * page_size + t) * G_max + grp];
+                    float rescaled = (float)old_q * ratio;
+                    rescaled = fminf(fmaxf(roundf(rescaled), 0.f), 255.f);
+                    radius_codes[(pid * page_size + t) * G_max + grp] = (uint8_t)rescaled;
+                }
+                r_scales[pid * G_max + grp] = norm;
+                r_scale = norm;
+            } else {
+                r_scale = prev_scale;
+            }
         }
         float r_q = roundf(norm / (r_scale + 1e-8f) * 255.0f);
         r_q = fminf(fmaxf(r_q, 0.f), 255.f);
@@ -91,22 +105,6 @@ void sphkv_encode_append_launcher(
         pids.data_ptr<long>(),
         slot, G, g, C, G_max, dh, page_size, is_new_page);
 }
-
-
-/* ═══════════════════════════════════════════════════════════════════
- * KERNEL 2: Fused decode
- *
- * Paper §2.1 exact decomposition:
- *   q⊤k / √d = (1/√d) Σ_j ‖q_j‖ · ‖k_j‖ · cos θ_j
- *
- * Our computation (implicitly w_j = ‖q_j‖):
- *   α = (1/√d) Σ_j r̂_j · dot(q_j, c_{idx})
- *     = (1/√d) Σ_j r̂_j · ‖q_j‖ · cos_hat θ_j
- *
- * This matches the exact decomposition when r̂_j ≈ ‖k_j‖.
- * NOT normalizing Q preserves the correct logit magnitude.
- * ═══════════════════════════════════════════════════════════════════ */
-
 __global__
 void sphkv_fused_kernel(
     const float*   __restrict__ q_all,
@@ -176,7 +174,7 @@ void sphkv_fused_kernel(
     }
     __syncthreads();
 
-    /* Phase 1: ADA logit — w_j = ‖q_j‖ (implicit, no Q normalization) */
+    /* Phase 1: ADA logit (Algorithm 1 line 85, w^(j) = ‖q_j‖ implicit). */
     float logit_sum = 0.f;
     if (tid < page_size) {
         for (int g = 0; g < G_tier; g++) {
@@ -186,7 +184,6 @@ void sphkv_fused_kernel(
             const float* q_g  = sq + g * g_tier;
             const float* cb_g = scb + g * cb_stride_g + code * cb_stride_c;
 
-            /* dot(q_j, c_{idx}) = ‖q_j‖ · cos_hat θ_j */
             float dot = 0.f;
             for (int d = 0; d < g_tier; d++)
                 dot += q_g[d] * cb_g[d];
@@ -197,7 +194,7 @@ void sphkv_fused_kernel(
     s_logits[tid] = (logit_sum == 0.f) ? -1e9f : logit_sum * sm_scale;
     __syncthreads();
 
-    /* Phase 2: online softmax + V accumulation (unchanged) */
+    /* Phase 2: online softmax + V accumulation */
     float m_i = -INFINITY, l_i = 0.f, acc = 0.f;
     const int v_page_base = phys * page_size * dh;
     for (int t = 0; t < page_size; t++) {

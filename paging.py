@@ -15,19 +15,9 @@ class PageHeader:
 
     @property
     def header_bytes(self) -> int:
-        """Total header size in bytes: HEADER_BYTES + G x 4."""
         return HEADER_BYTES + self.G * 4
 
     def to_tensor(self) -> torch.Tensor:
-        """
-        Serialise to a flat uint8 tensor of length header_bytes.
-
-        Layout:
-          byte 0       : tier_id
-          byte 1       : count
-          bytes 2-7    : zeros (padding / flags)
-          bytes 8 ..   : r_scales as packed float32 little-endian
-        """
         device = self.r_scales.device
         buf = torch.zeros(self.header_bytes, dtype=torch.uint8, device=device)
 

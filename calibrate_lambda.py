@@ -1,9 +1,3 @@
-"""
-Primary calibration protocol
-Usage:
-    python calibrate_lambda.py --model_name_or_path meta-llama/Llama-3.2-1B --codebook_dir codebooks/codebooks_llama_1b --dataset pg19 --S 5 --T 32 --probes_per_step 16 --device cuda --output_dir calibration_results
-"""
-
 import argparse
 import json
 import math

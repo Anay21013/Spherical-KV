@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 
+
 def normalize_answer(s: str) -> str:
     s = s.lower()
     s = re.sub(r'\b(a|an|the)\b', ' ', s)
@@ -62,6 +63,7 @@ def f1_score(prediction: str, gold_answers: List[str]) -> float:
         f1 = 2 * precision * recall / (precision + recall)
         best_f1 = max(best_f1, f1)
     return best_f1
+
 
 
 def _build_prompt(context: str, question: str, tokenizer=None) -> str:
@@ -158,6 +160,8 @@ def build_qa_prompt_with_boundaries(
         boundaries.append((ts, te))
     return prompt, input_ids, boundaries
 
+
+
 @torch.no_grad()
 def _generate_dense_hf(model, tokenizer, prompt, device, max_new=64):
     ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
@@ -193,6 +197,7 @@ def _generate_sphkv_hf(model, tokenizer, prompt, device, max_new=64):
         return "", 0, gen_time
     return (_extract_short_answer(tokenizer.decode(gen, skip_special_tokens=True)),
             len(gen), gen_time)
+
 
 
 @torch.no_grad()
@@ -239,22 +244,21 @@ def _generate_sphkv_vllm(vllm_fwd, tokenizer, input_ids, pipeline,
     _cfg.BITS_PER_TOKEN = budget_bpt
     _cfg.GLOBAL_BUDGET_BITS = budget_bpt * T * vllm_fwd.num_layers * vllm_fwd.num_kv
 
-    # 4. Pipeline prefill — retrieval boundaries (paper §3.3)
-    attn_w = [None] * vllm_fwd.num_layers
-    ho = [None] * vllm_fwd.num_layers
+    attn_w = list(getattr(vllm_fwd, '_last_prefill_reuse_q', None)
+                  or [None] * vllm_fwd.num_layers)
+    ho = list(getattr(vllm_fwd, '_last_prefill_head_out', None)
+              or [None] * vllm_fwd.num_layers)
     pipeline.prefill(
         kv_pairs=kv_pairs, attn_weights=attn_w, head_outputs=ho,
         pre_rope_K_list=post_rope_K_list, seq_len=T, skip_patch=True,
         retrieval_boundaries=boundaries or [])
 
-    # Capture segment-wise tier breakdown (paper §3.3 controller evidence)
     seg_stats = _extract_segment_tier_stats(pipeline)
 
     first_tok = prefill_logits[0, -1].float().argmax().item()
     del kv_pairs, post_rope_K_list, attn_w, ho, prefill_logits
     torch.cuda.empty_cache()
 
-    # 5. Decode (ONLY this part counts for tok/s)
     gen = []
     if first_tok == tokenizer.eos_token_id:
         return "", 0, 0.0, seg_stats
@@ -278,6 +282,7 @@ def _generate_sphkv_vllm(vllm_fwd, tokenizer, input_ids, pipeline,
         return "", 0, 0.0, seg_stats
     return (_extract_short_answer(tokenizer.decode(gen, skip_special_tokens=True)),
             len(gen), decode_time, seg_stats)
+
 
 
 _SEG_NAMES = {0: "prefix", 1: "retrieved", 2: "recent"}
@@ -306,7 +311,6 @@ def _extract_segment_tier_stats(pipeline):
 
 
 def _format_segment_tier_table(stats):
-    """Pretty-print segment x tier table."""
     if not stats:
         return ""
     seg_totals = stats.get("_per_segment_total", {})
@@ -320,6 +324,7 @@ def _format_segment_tier_table(stats):
         if total > 0:
             lines.append(f"    {seg_name:<10} {b1:>8} {b2:>8} {b3:>8} {total:>8}")
     return "\n".join(lines)
+
 
 
 @torch.inference_mode()
@@ -356,7 +361,6 @@ def evaluate_w2(
         prefill_len = input_ids.shape[1]
         total_ctx_tokens += prefill_len
 
-        # Generate (returns text, n_tokens, decode_time)
         try:
             if mode == "dense":
                 if vllm_engine is not None:
@@ -371,9 +375,6 @@ def evaluate_w2(
                         vllm_fwd, tokenizer, input_ids, pipeline,
                         budget_bpt, device, max_new_tokens,
                         boundaries=boundaries)
-                    # Accumulate segment stats across samples
-                    # Keys are tuples (seg_name, tier_id) for counts;
-                    # string keys (e.g. "_total_retained") are metadata — skip.
                     for k, v in samp_stats.items():
                         if not isinstance(k, tuple):
                             continue
@@ -396,7 +397,14 @@ def evaluate_w2(
         all_em.append(em)
         all_f1.append(f1)
 
-        # Cleanup
+        if i < 3:
+            gold_str = " | ".join(sample["answers"][:2]) if isinstance(sample["answers"], list) else str(sample["answers"])
+            pred_show = (pred[:120] + "...") if len(pred) > 120 else pred
+            gold_show = (gold_str[:120] + "...") if len(gold_str) > 120 else gold_str
+            print(f"    [{mode} sample {i}] F1={f1*100:.1f}%")
+            print(f"      gold: {gold_show!r}")
+            print(f"      pred: {pred_show!r}")
+
         if pipeline is not None and hasattr(pipeline, '_patched') and pipeline._patched:
             pipeline.uninstall()
 
@@ -412,10 +420,8 @@ def evaluate_w2(
     avg_em = sum(all_em) / max(len(all_em), 1)
     avg_f1 = sum(all_f1) / max(len(all_f1), 1)
 
-    # tok/s = decode tokens only / decode time only
     tok_s = total_gen_tokens / max(total_decode_time, 1e-6)
 
-    # bKV
     bKV = 0.0
     src = model if model is not None else vllm_fwd
     if src is not None:
@@ -431,13 +437,8 @@ def evaluate_w2(
         else:
             bKV = L * H * (math.ceil(budget_bpt / 8) + dh * 2)
 
-    # HBM bytes/token: K-path payload + V (paper §B.2)
-    # Dense: 2*dh + 2*dh = 4*dh per (L,H) read per decode step
-    # SphKV: bytesK(b) + 2*dh — but each token can be at different tier,
-    # so we report the average effective HBM/token from bKV (resident == read).
     hBM_per_tok = bKV  # resident bytes ~ HBM bytes per decode step (no dense reconstruction)
 
-    # Print + log segment-wise tier breakdown
     seg_table = ""
     if agg_seg_stats:
         print(f"\n  ── Segment-wise retention + tiering (controller evidence, §3.3) ──")

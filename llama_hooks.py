@@ -154,10 +154,6 @@ def capture_prefill_pass(
 
 
 def patch_for_decode(model, pipeline) -> Dict[int, object]:
-    """
-    Patch attention layers AND pre-compute RoPE tables.
-    The decode hot path does ZERO HF module calls.
-    """
     rot = getattr(model.model, "rotary_emb", None) \
         or getattr(model.model.layers[0].self_attn, "rotary_emb", None)
     if rot is None:
@@ -201,9 +197,6 @@ def unpatch_decode(model, originals: Dict[int, object]) -> None:
 
 
 def _make_patched_forward(layer_idx: int, pipeline):
-    """
-    HOT PATH. Zero HF calls, zero allocations, zero imports.
-    """
     _sm_scale = 1.0 / math.sqrt(pipeline.head_dim)
 
     def patched_forward(
@@ -283,4 +276,12 @@ def build_attn_weights_tensor(attn_weights):
 
 
 def build_head_outputs_tensor(head_outputs):
-    return None
+    valid = [h for h in head_outputs if h is not None]
+    if not valid:
+        return None
+    try:
+        stacked = torch.stack(valid, dim=0)            # [L, B, H, dh]
+        out = stacked.transpose(0, 1).contiguous().float()  # [B, L, H, dh]
+        return out.unsqueeze(3)                        # [B, L, H, 1, dh]
+    except Exception:
+        return None

@@ -10,9 +10,6 @@ def load_codebooks(
     num_kv_heads: int,
     tiers,                     # list from build_tiers()
 ) -> Dict[Tuple[int, int, int], torch.Tensor]:
-    """
-    Load all per-(layer, head, tier) codebooks.
-    """
     if not os.path.isdir(codebook_dir):
         raise FileNotFoundError(f"Codebook directory not found: {codebook_dir}")
 

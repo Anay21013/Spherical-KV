@@ -30,12 +30,6 @@ from negative_controls import (
 
 
 class HBMProfiler:
-    """
-    Measures HBM bytes/token during decode.
-    Uses torch.cuda memory stats as a proxy.
-    For hardware DRAM counters, use ncu externally:
-        ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum ...
-    """
     def __init__(self, device, enabled=True):
         self.device = device
         self.enabled = enabled and device.type == "cuda"
@@ -142,7 +136,7 @@ def measure_dense_decode(model, eval_ids, T, n_warm, n_meas, n_trials, device):
     head_dim = getattr(cfg, "head_dim",
                        cfg.hidden_size // cfg.num_attention_heads)
     # Dense bKV (bits per token): 2 tensors (K, V) x 16 bits fp16 x num_layers
-    # x num_kv_heads x head_dim.  This is the per-token KV footprint.
+    # x num_kv_heads x head_dim.  This is the per-token KV footprint
     bKV_per_tok_bits = 2 * 16 * cfg.num_hidden_layers * num_kv * head_dim
     return {
         "mode":      "dense",
@@ -171,10 +165,6 @@ def measure_sphkv_decode(
     device:   torch.device,
     bpt:      float = 30.9,
 ):
-    """
-    Measure SphericalKV variants: tok/s, NLL, memory, tier distribution.
-    Handles modes: sphkv, sphkv_recon, sphkv_angle, sphkv_rd
-    """
     prefill_ids = eval_ids[:, :T].to(device)
 
     # Set budget
@@ -189,12 +179,6 @@ def measure_sphkv_decode(
     for trial in range(n_trials):
         # Fresh prefill each trial
         pipeline.prefill(prefill_ids)
-
-        # First decode token must be eval_ids[T] at position T — exactly
-        # mirroring the dense baseline.  Re-feeding prefill_ids[:, -1:]
-        # would (a) duplicate the last prefill token and (b) shift every
-        # subsequent token one position forward in the spherical cache,
-        # creating a corrupted context the model has never seen.
         last_tok = eval_ids[:, T:T + 1].to(device)
 
         for wi in range(n_warm):
@@ -225,7 +209,6 @@ def measure_sphkv_decode(
                 torch.cuda.synchronize()
                 import time as _t; _st = _t.perf_counter()
 
-            # Manual forward — bypass HF model.forward overhead entirely
             with torch.no_grad():
                 hidden_states = model.model.embed_tokens(last_tok)
                 for layer in model.model.layers:
@@ -320,9 +303,6 @@ def _measure_memory(pipeline, T: int) -> dict:
 
     for (layer, head), tier_list in pipeline.per_head_pages.items():
         for entry in tier_list:
-            # Entry layout (>=6 slots, 7 with positions):
-            #   [0] pages_tensor, [1] ptable_tensor, [2] b_theta,
-            #   [3] n_tokens, [4] V_tier, [5] (r,theta) codes, [6] positions
             pages_tensor  = entry[0]
             ptable_tensor = entry[1]
             V_tier        = entry[4]
@@ -356,13 +336,6 @@ def compute_stability_metrics(
     sphkv_results: dict,
     n_seeds:       int = 1,
 ) -> dict:
-    """
-    Compute stability metrics from multi-seed results.
-
-    S_traj: variance of NLL across seeds
-    DeltaT: mean |len(sphkv_generated) - len(dense_generated)| across seeds
-    """
-    # S_traj: variance of quality across seeds
     if len(sphkv_results.get("nll_all", [])) > 1:
         s_traj = statistics.variance(sphkv_results["nll_all"])
     else:
@@ -398,18 +371,15 @@ def build_iso_quality_frontier(
     all_results: List[dict],
     delta:       float = 0.8,
 ) -> dict:
-    # Find dense baseline
     dense_pts = [r for r in all_results if r["mode"] == "dense"]
     if not dense_pts:
         return {"error": "no dense baseline found"}
 
-    # Best dense quality (lowest NLL)
     best_dense = min(dense_pts, key=lambda r: r["nll"])
     nll_dense = best_dense["nll"]
     tps_dense = best_dense["tok_s"]
     bkv_dense = best_dense["bKV"]
 
-    # Quality threshold: NLL <= nll_dense + delta
     nll_threshold = nll_dense + delta
 
     # Filter quality-matched points
@@ -424,12 +394,10 @@ def build_iso_quality_frontier(
         else:
             excluded.append(r)
 
-    # Group by mode for Pareto computation
     mode_points = defaultdict(list)
     for r in retained:
         mode_points[r["mode"]].append(r)
 
-    # Compute Pareto envelope per mode: non-dominated in (bKV↓, tok/s↑)
     frontiers = {}
     for mode, pts in mode_points.items():
         pts.sort(key=lambda p: p["bKV"])
@@ -441,7 +409,6 @@ def build_iso_quality_frontier(
                 best_tps = p["tok_s"]
         frontiers[mode] = pareto
 
-    # Iso-quality speedup: max(s_sphkv) / s_dense among matched points
     sphkv_retained = [r for r in retained if r["mode"] != "dense"]
     if sphkv_retained:
         best_sphkv_tps = max(r["tok_s"] for r in sphkv_retained)
@@ -449,7 +416,6 @@ def build_iso_quality_frontier(
     else:
         iso_quality_speedup = 1.0
 
-    # Iso-throughput memory reduction: min bKV among points with tok/s >= tps_dense
     fast_enough = [r for r in sphkv_retained if r["tok_s"] >= tps_dense]
     if fast_enough:
         best_bkv = min(r["bKV"] for r in fast_enough)
@@ -457,7 +423,6 @@ def build_iso_quality_frontier(
     else:
         iso_throughput_mem_reduction = 1.0
 
-    # Synergy gap (A2 non-additivity test)
     synergy = _compute_synergy_gap(all_results, nll_dense, delta)
 
     return {
@@ -613,7 +578,7 @@ def plot_budget_sweep(all_results: List[dict], output_dir: Path):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="SphericalKV experiment runner (Sections 3-4)")
+        description="SphericalKV experiment runner ")
 
     # Models (Section 3.2: Llama-3.1-8B, Qwen2.5-14B, gpt-oss-20b)
     p.add_argument("--models", nargs="+",
@@ -640,7 +605,6 @@ def parse_args():
     p.add_argument("--num_eval_tokens", type=int, default=0,
                    help="0 = auto from context_length + decode buffer")
 
-    # Modes to run (Section 4.2 ablations + Section 3.6 baselines)
     ALL_MODES = list(MODES.keys()) + [
         "streaming_llm", "h2o", "quant_2bit", "quant_4bit", "quant_8bit",
         "keepdrop", "quant_only", "decoupled",
@@ -757,7 +721,6 @@ def main():
 
         all_results = []   # results for this model
 
-        # Table 2: Hardware audit
         from hardware_audit import generate_hardware_table, print_hardware_table
         hw_info = generate_hardware_table(device)
         hw_info["model"] = model_tag
@@ -767,7 +730,6 @@ def main():
         print_hardware_table(hw_info)
         all_results.append({"type": "hardware_audit", "model": model_tag, **hw_info})
 
-        # all_results = []   # results for this model
 
         if "w1" in args.workloads:
             print(f"\n{'='*60}")
@@ -783,7 +745,6 @@ def main():
             for T in sorted(args.context_lengths):
                 print(f"\n  --- Context T={T} ---")
 
-                # Dense baseline
                 if "dense" in args.modes:
                     print(f"  [T={T}] Dense ...")
                     if args.backend == "vllm":
@@ -799,7 +760,6 @@ def main():
                     all_results.append(dr)
                     print(f"    tok/s={dr['tok_s']:.1f}  NLL={dr['nll']:.4f}  PPL={dr['ppl']:.2f}  bKV={dr['bKV']:.0f}")
 
-                # External baselines (streaming_llm, h2o, quant_Xbit)
                 from baselines import BASELINE_MODES, run_baseline
                 baseline_modes = [m for m in args.modes if m in BASELINE_MODES]
                 for bmode in baseline_modes:
@@ -815,19 +775,15 @@ def main():
                     except Exception as e:
                         print(f"    ERROR: {e}")
 
-                # SphericalKV modes + ablation modes x budgets
                 from ablation_modes import (ABLATION_MODES, apply_ablation_mode,
                                             restore_ablation_mode)
                 sphkv_modes = [m for m in args.modes
                                if m not in ("dense",) and m not in BASELINE_MODES]
-                # Modes that need an effectively unbounded budget so RDR does
-                # not drop tokens (the ablation hook does the real work).
                 _RETAIN_ALL_MODES = {"quant_only", "sphkv_angle"}
                 for mode in sphkv_modes:
                     for bpt in args.budgets:
                         print(f"  [T={T}] {mode} @ {bpt:.0f} bpt ...")
                         from spherical_kv_pipeline import SphericalKVPipeline
-                        # Use raw vLLM model if backend=vllm (has .config)
                         _model_for_pipeline = raw_model if args.backend == "vllm" else model
                         pipeline = SphericalKVPipeline(
                             model=_model_for_pipeline, tokenizer=tokenizer,
@@ -837,8 +793,6 @@ def main():
                             sink_tokens=_cfg.SINK_TOKENS,
                             use_fused=(device.type == "cuda"))
 
-                        # sphkv_recon / sphkv_rd use reconstruct-then-dot at
-                        # decode time -- the flag is read inside the pipeline.
                         if mode in ("sphkv_recon", "sphkv_rd"):
                             pipeline._use_recon = True
 
@@ -894,7 +848,6 @@ def main():
                     print(f"  Context L={T_max}")
                     print(f"  {'─'*50}")
 
-                    # Collect samples across all tasks at this context length
                     all_task_samples = {}
                     for task in args.w2_tasks:
                         try:
@@ -919,7 +872,6 @@ def main():
                     for n_dist in args.w2_distractors:
                         for pos in args.w2_positions:
 
-                            # ── Dense: run per-task, aggregate ──
                             Q_dense = None
                             dense_ems, dense_f1s = [], []
                             if "dense" in args.modes:
@@ -945,7 +897,6 @@ def main():
                                               f"F1={w2r['f1']*100:.1f}%  "
                                               f"({len(samps)} samples)")
 
-                                    # Aggregate across tasks
                                     if dense_f1s:
                                         agg_em = sum(dense_ems) / len(dense_ems)
                                         agg_f1 = sum(dense_f1s) / len(dense_f1s)
@@ -966,7 +917,6 @@ def main():
                                               f"EM={agg_em*100:.1f}%  "
                                               f"({len(dense_f1s)} total)")
 
-                            # ── SphKV: run per-task, aggregate ──
                             if "sphkv" in args.modes:
                                 if _w2_model is None and _w2_vllm is None:
                                     print("    SKIP sphkv: no model")
@@ -1119,7 +1069,6 @@ def main():
                 print(f"  W3 failed: {e}")
                 import traceback; traceback.print_exc()
 
-        # ── Analysis: TTFT, head stats, segments, drift ───────────────
         from analysis import (measure_ttft, compute_head_allocation_stats,
                               compute_segment_profiles, compute_failure_rates,
                               compute_drift_auroc, plot_head_allocation,
@@ -1128,7 +1077,6 @@ def main():
         model_dir = out_dir / model_tag
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        # TTFT (skip for vLLM backend — model is None)
         if "w1" in args.workloads and model is not None:
             print(f"\n  TTFT measurement ...")
             for T in args.context_lengths[:1]:  # first context length
@@ -1157,7 +1105,6 @@ def main():
                     all_results.append({"type": "ttft", "mode": "sphkv",
                                         "model": model_tag, "T": T, **ttft_s})
 
-        # Head allocation (A3) + Segment profiles (A4) — skip for vLLM
         sphkv_w1 = [r for r in all_results
                     if r.get("mode") == "sphkv" and r.get("workload") == "w1"]
         if sphkv_w1 and model is not None:
@@ -1201,7 +1148,6 @@ def main():
 
             pip_a.uninstall()
 
-        # Full cost accounting + decode breakdown (Section 3.5 / 4.3)
         if sphkv_w1 and model is not None:
             from hardware_audit import measure_full_cost, measure_decode_breakdown
             T_fc = args.context_lengths[0]
@@ -1216,7 +1162,6 @@ def main():
                 head_dim=head_dim, group_size=_cfg.GROUP_SIZE,
                 sink_tokens=_cfg.SINK_TOKENS, use_fused=(device.type == "cuda"))
 
-            # Full cost
             fc = measure_full_cost(model, pip_fc, pfill_fc,
                                     n_meas=args.n_meas, device=device)
             print(f"  Full cost: prefill={fc['t_prefill_ms']:.0f}ms "
@@ -1224,7 +1169,6 @@ def main():
                   f"({fc['prefill_pct']:.1f}% prefill)")
             all_results.append({"type": "full_cost", "model": model_tag, **fc})
 
-            # Decode breakdown
             pip_fc2 = SphericalKVPipeline(
                 model=model, tokenizer=tokenizer,
                 codebooks=codebooks, device=device,
@@ -1235,7 +1179,6 @@ def main():
             print(f"  Decode breakdown: {bd}")
             all_results.append({"type": "decode_breakdown", "model": model_tag, **bd})
 
-        # Failure rates
         measurable = [r for r in all_results if "mode" in r and "nll" in r]
         if measurable:
             fr = compute_failure_rates(measurable)
@@ -1245,7 +1188,6 @@ def main():
                                        if not isinstance(v, dict)}})
                 plot_failure_rates(fr, model_dir)
 
-        # Stability (multi-seed)
         if args.n_seeds > 1 or args.n_trials > 1:
             dense_r = [r for r in all_results
                        if r.get("mode") == "dense" and "nll" in r]
@@ -1258,7 +1200,6 @@ def main():
                 all_results.append({"type": "stability",
                                     "model": model_tag, **stab})
 
-        # Frontier
         if measurable:
             frontier = build_iso_quality_frontier(measurable, args.delta)
             print(f"  Frontier: speedup={frontier.get('iso_quality_speedup',1):.2f}x  "
@@ -1268,7 +1209,6 @@ def main():
 
         grand_results.extend(all_results)
 
-        # Free model memory before loading next
         del model, tokenizer, codebooks
         torch.cuda.empty_cache()
 
@@ -1294,19 +1234,16 @@ def main():
                   f, indent=2, default=str)
     print(f"\nSaved: {results_path}")
 
-    # ── Generate ALL paper figures ────────────────────────────────────
     from paper_plots import generate_all_paper_figures
     model_tags = [m.split("/")[-1] for m in args.models]
     generate_all_paper_figures(
         grand_results, model_tags, args.context_lengths,
         str(out_dir), args.delta)
 
-    # ── ncu command guidance ──────────────────────────────────────────
     from hardware_audit import generate_ncu_command
     print(f"\n  For hardware DRAM counters, run:")
     print(f"    {generate_ncu_command('experiment_runner.py', '--modes sphkv --budgets 30')}")
 
-    # ── Summary table ─────────────────────────────────────────────────
     print(f"\n{'='*80}")
     print(f"  Summary (Table 5 format)")
     print(f"{'='*80}")
@@ -1327,10 +1264,8 @@ def main():
               f"{r['tok_s']:>7.1f} {r.get('bKV',0):>8.0f}")
 
 
-    # ── W2 summary ──
     w2_rows = [r for r in grand_results if r.get('workload') == 'w2' and 'Q' in r]
     if w2_rows:
-        # Show aggregated (ALL tasks) rows first — this is Table 5
         agg_rows = [r for r in w2_rows if r.get('task') == 'ALL']
         if agg_rows:
             print(f"\n  W2 Quality — Aggregated (Table 5 format)")
@@ -1346,7 +1281,6 @@ def main():
                       f"{r.get('tok_s',0):>7.1f} {r.get('bKV',0):>8.0f} "
                       f"{r.get('hBM_per_tok',0):>8.0f} {r.get('n_samples',0):>5}")
 
-        # Per-task breakdown
         task_rows = [r for r in w2_rows if r.get('task') != 'ALL']
         if task_rows:
             print(f"\n  W2 Quality — Per-task breakdown")
@@ -1359,7 +1293,6 @@ def main():
                       f"{r.get('T',0):>6} {bpt_s} {r['Q']:>7.1f}% "
                       f"{r['em']*100:>6.1f}% {r.get('n_samples',0):>5}")
 
-        # Segment-wise tier breakdown (paper §3.3 controller evidence)
         sphkv_agg = [r for r in agg_rows
                      if r.get('mode') == 'sphkv' and r.get('segment_tier_counts')]
         if sphkv_agg:

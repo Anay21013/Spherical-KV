@@ -36,9 +36,6 @@ def _save(fig, path):
     print(f"  -> {path}")
 
 
-# =========================================================================
-# Fig 4: 3x3 Iso-quality Pareto Grid
-# =========================================================================
 
 def plot_fig4(
     all_results: List[dict],
@@ -128,9 +125,7 @@ def plot_fig4(
     _save(fig, Path(output_dir) / "fig4_pareto_grid.png")
 
 
-# =========================================================================
-# Fig 5: 2x3 Ablation Grid at L=128K
-# =========================================================================
+# =================================================================
 
 def plot_fig5(
     all_results: List[dict],
@@ -139,11 +134,6 @@ def plot_fig5(
     delta: float = 0.8,
     output_dir: str = ".",
 ):
-    """
-    2x3 grid: columns = models.
-    Top row: A0-A3 frontier (bKV vs tok/s).
-    Bottom row: A4 segment profiles + A5 failure rates.
-    """
     if not HAS_MPL:
         return
     fig, axes = plt.subplots(2, len(models), figsize=(5*len(models), 8),
@@ -204,9 +194,6 @@ def plot_fig5(
     _save(fig, Path(output_dir) / "fig5_ablation_grid.png")
 
 
-# =========================================================================
-# Fig 6: Stability Phase Diagram + Danger Score Trace
-# =========================================================================
 
 def plot_fig6(
     drift_data:   dict,
@@ -280,9 +267,6 @@ def plot_fig6(
     _save(fig, Path(output_dir) / "fig6_stability_phase.png")
 
 
-# =========================================================================
-# Depth-conditioned quality curves
-# =========================================================================
 
 def plot_depth_quality(
     w2_results: List[dict],
@@ -338,9 +322,6 @@ def plot_depth_quality(
     _save(fig, Path(output_dir) / "plot_depth_quality.png")
 
 
-# =========================================================================
-# Quality vs Context Length degradation curves
-# =========================================================================
 
 def plot_quality_vs_length(
     all_results: List[dict],
@@ -375,9 +356,6 @@ def plot_quality_vs_length(
     _save(fig, Path(output_dir) / "plot_quality_vs_length.png")
 
 
-# =========================================================================
-# bHBM vs Budget (kernel-realism microbench panel)
-# =========================================================================
 
 def plot_bhbm_vs_budget(
     all_results: List[dict],
@@ -413,9 +391,6 @@ def plot_bhbm_vs_budget(
     _save(fig, Path(output_dir) / "plot_bhbm_vs_budget.png")
 
 
-# =========================================================================
-# Logit-drift distribution histogram
-# =========================================================================
 
 def plot_logit_drift_distribution(
     drift_data: dict,
@@ -447,9 +422,6 @@ def plot_logit_drift_distribution(
     _save(fig, Path(output_dir) / "plot_logit_drift_dist.png")
 
 
-# =========================================================================
-# Budget-normalized quality
-# =========================================================================
 
 def plot_budget_normalized_quality(
     all_results: List[dict],
@@ -479,9 +451,6 @@ def plot_budget_normalized_quality(
     _save(fig, Path(output_dir) / "plot_budget_normalized_quality.png")
 
 
-# =========================================================================
-# Table 5: Star Marker Selection
-# =========================================================================
 
 def select_star_markers(
     all_results: List[dict],
@@ -547,9 +516,6 @@ def print_table5(rows: List[dict]):
               f"{r['peakKV_dense_GB']:>7.3f} {r['peakKV_sphkv_GB']:>7.3f}")
 
 
-# =========================================================================
-# Table 6: Failure Mode Classification
-# =========================================================================
 
 def classify_failures(
     all_results: List[dict],

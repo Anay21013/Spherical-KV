@@ -20,11 +20,6 @@ def reconstruct_dense_K_from_codes(
     num_groups:  int,
     device:      torch.device,
 ) -> torch.Tensor:
-    """
-    Reconstruct dense K vectors from spherical codes.
-    K_recon[i] = concat_g( r_codes[i,g] * codeword[g, theta_codes[i,g]] )
-    Returns [N, dh] dense float32.
-    """
     N = r_codes.shape[0]
     r_c  = r_codes.to(device)         # [N, G]
     th_c = theta_codes.to(device).long()  # [N, G]
@@ -53,10 +48,6 @@ def recon_attention_batched(
     k_new:     torch.Tensor,   # [dh]
     v_new:     torch.Tensor,   # [dh]
 ) -> torch.Tensor:
-    """
-    SphKV-Recon: reconstruct dense K from codes, then standard dot-product.
-    Same codes and tier assignments as full SphKV, but pays the densification tax.
-    """
     key    = (layer_idx, kv_head)
     device = q_batch.device
     num_q  = q_batch.shape[0]
@@ -141,10 +132,6 @@ def run_mode_decode(
     n_meas:     int,
     device:     torch.device,
 ) -> Tuple[List[int], float, float]:
-    """
-    Run n_warm + n_meas decode steps in the specified mode.
-    Returns (generated_ids, elapsed_seconds, hbm_bytes_proxy).
-    """
     is_cuda = device.type == "cuda"
     current_ids = prefill_ids.to(device).clone()
     generated = []
